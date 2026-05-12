@@ -18,78 +18,79 @@ if (host.platformIsMac()) {
 }
 
 // Flip to true to dump every incoming MIDI message to the controller console.
-var DEBUG = false;
+const DEBUG = false;
 
 // ---------------------------------------------------------------------------
 // CC1 MIDI Mapping — Simple HUI as exposed by Yamaha ControlCenter
 // ---------------------------------------------------------------------------
 // Encoders (relative): 0x40 bit set = clockwise/+, clear = counter/-, low 6 bits = magnitude.
-var CC_AI_KNOB   = 0x0D;
-var CC_PAN_KNOB  = 0x40;
+const CC_AI_KNOB   = 0x0D;
+const CC_PAN_KNOB  = 0x40;
 
 // 14-bit fader: paired CCs (CC 0x00 MSB + CC 0x20 LSB). The LSB arrives via
 // running status, which Bitwig delivers to onMidi with status=0x20 (not 0xB0).
-var CC_FADER_MSB = 0x00;
-var CC_FADER_LSB = 0x20;
+const CC_FADER_MSB = 0x00;
+const CC_FADER_LSB = 0x20;
 
 // HUI buttons: zone selector + port selector pair. Port high bit (0x40) = press.
-var CC_HUI_ZONE = 0x0F;
-var CC_HUI_PORT = 0x2F;
+const CC_HUI_ZONE = 0x0F;
+const CC_HUI_PORT = 0x2F;
+
+// Mechanical encoders bounce: a quick forward turn can briefly register a
+// reverse tick. Suppress reverses that arrive within this window of an
+// opposite-direction tick.
+const ENCODER_DEBOUNCE_MS = 80;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-var transport;
-var application;
-var arranger;
-var detailEditor;
-var cursorTrack;
-var trackVolume;
-var trackPan;
-var aiKnobParam;
+let transport;
+let application;
+let arranger;
+let detailEditor;
+let cursorTrack;
+let trackVolume;
+let trackPan;
+let aiKnobParam;
+let faderParam;
 
 // Tracks Bitwig's active panel layout: "ARRANGE", "EDIT", or "MIX".
 // Drives which view the AI knob zooms in zoom mode.
-var currentPanel = "ARRANGE";
+let currentPanel = "ARRANGE";
 
-var BUTTONS = {};   // "zone:port" -> handler entry
-var LED_KEYS = {};  // ledKey -> {zone, port}
+const BUTTONS = {};   // "zone:port" -> handler entry
+const LED_KEYS = {};  // ledKey -> {zone, port}
 
-var currentHuiZone = 0;
-var faderMsb = 0;
-var isFaderTouched = false;
-var pendingFaderValue = -1;
-var lastSentFaderValue = -1;
-var ledState = {};
-var pendingLeds = {};
+let currentHuiZone = 0;
+let faderMsb = 0;
+let isFaderTouched = false;
+let pendingFaderValue = -1;
+let lastSentFaderValue = -1;
+const ledState = {};
+let pendingLeds = {};
 
 // AI Knob mode: "zoom" = knob controls vertical (track-height) zoom of the
 // arranger, "param" = knob controls the hovered (or locked) parameter. AI
 // button toggles. Lock button engages "param" + locks in one press, or
 // smart-toggles lock when already in "param".
-var aiKnobMode = "zoom";
+let aiKnobMode = "zoom";
 
 // Fader mode: "volume" = follows cursor track volume, "param" = rides the
 // last-clicked parameter (separate LastClickedParameter from the AI knob).
 // Automation button toggles.
-var faderMode = "volume";
-var faderParam;            // LastClickedParameter for the fader
-var faderParamName = "";   // cached for popup
-var volumeValue = 0;       // cached current volume (so mode toggle can refresh)
-var paramValue = 0;        // cached current fader-param value
+let faderMode = "volume";
+let faderParamName = "";   // cached for popup
+let volumeValue = 0;       // cached current volume (so mode toggle can refresh)
+let paramValue = 0;        // cached current fader-param value
 
-// Mechanical encoders bounce: a quick forward turn can briefly register a
-// reverse tick. Suppress reverses that arrive within this window of an
-// opposite-direction tick.
-var ENCODER_DEBOUNCE_MS = 80;
-var lastEncoderDelta = 0;
-var lastEncoderTime = 0;
+let lastEncoderDelta = 0;
+let lastEncoderTime = 0;
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 function init() {
-   var midiIn = host.getMidiInPort(0);
+   const midiIn = host.getMidiInPort(0);
    midiIn.setMidiCallback(onMidi);
    midiIn.setSysexCallback(onSysex);
 
@@ -188,9 +189,9 @@ function onCC(cc, value) {
 }
 
 function handleHuiPort(value) {
-   var port = value & 0x0F;
-   var isPress = (value & 0x40) !== 0;
-   var btn = BUTTONS[currentHuiZone + ":" + port];
+   const port = value & 0x0F;
+   const isPress = (value & 0x40) !== 0;
+   const btn = BUTTONS[currentHuiZone + ":" + port];
    if (!btn) return;
    if (isPress) {
       if (btn.onPress) btn.onPress();
@@ -200,16 +201,16 @@ function handleHuiPort(value) {
 }
 
 function handleEncoder(param, value) {
-   var magnitude = value & 0x3F;
-   var delta = (value & 0x40) ? magnitude : -magnitude;
+   const magnitude = value & 0x3F;
+   const delta = (value & 0x40) ? magnitude : -magnitude;
    param.value().inc(delta, 128);
 }
 
 function handleAIKnob(value) {
-   var magnitude = value & 0x3F;
-   var delta = (value & 0x40) ? magnitude : -magnitude;
+   const magnitude = value & 0x3F;
+   const delta = (value & 0x40) ? magnitude : -magnitude;
 
-   var now = Date.now();
+   const now = Date.now();
    if (lastEncoderDelta * delta < 0 && (now - lastEncoderTime) < ENCODER_DEBOUNCE_MS) {
       return;
    }
@@ -219,9 +220,9 @@ function handleAIKnob(value) {
    if (aiKnobMode === "param") {
       aiKnobParam.parameter().value().inc(delta, 128);
    } else {
-      var steps = Math.abs(delta);
-      var zoomIn = delta > 0;
-      for (var i = 0; i < steps; i++) {
+      const steps = Math.abs(delta);
+      const zoomIn = delta > 0;
+      for (let i = 0; i < steps; i++) {
          if (currentPanel === "EDIT") {
             if (zoomIn) detailEditor.zoomInLaneHeights();
             else detailEditor.zoomOutLaneHeights();
@@ -256,8 +257,8 @@ function lockButton() {
 
 
 function handleFaderLSB(lsb) {
-   var v14 = (faderMsb << 7) | (lsb & 0x7F);
-   var normalized = v14 / 16383;
+   const v14 = (faderMsb << 7) | (lsb & 0x7F);
+   const normalized = v14 / 16383;
    if (faderMode === "volume") {
       trackVolume.value().set(normalized);
    } else {
@@ -290,7 +291,7 @@ function toggleFaderMode() {
    if (!isFaderTouched) {
       pendingFaderValue = (faderMode === "volume") ? volumeValue : paramValue;
    }
-   var label = (faderMode === "volume")
+   const label = (faderMode === "volume")
       ? "Track Volume"
       : "Riding " + (faderParamName || "(no parameter)");
    host.showPopupNotification("Fader: " + label);
@@ -309,7 +310,7 @@ function setLed(ledKey, on) {
 
 function flush() {
    if (pendingFaderValue >= 0) {
-      var v = Math.round(pendingFaderValue * 16383);
+      const v = Math.round(pendingFaderValue * 16383);
       if (v !== lastSentFaderValue) {
          sendMidi(0xB0, CC_FADER_MSB, (v >> 7) & 0x7F);
          sendMidi(0xB0, CC_FADER_LSB, v & 0x7F);
@@ -318,10 +319,10 @@ function flush() {
       pendingFaderValue = -1;
    }
 
-   for (var ledKey in pendingLeds) {
-      var on = pendingLeds[ledKey];
+   for (const ledKey in pendingLeds) {
+      const on = pendingLeds[ledKey];
       if (ledState[ledKey] === on) continue;
-      var btn = LED_KEYS[ledKey];
+      const btn = LED_KEYS[ledKey];
       if (!btn) continue;
       sendMidi(0xB0, CC_HUI_ZONE, btn.zone);
       sendMidi(0xB0, CC_HUI_PORT, btn.port | (on ? 0x40 : 0));
