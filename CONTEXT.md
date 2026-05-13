@@ -27,7 +27,9 @@ The Bitwig Connect 4/12 controller already does the hover-parameter thing with i
 
 ControlCenter ships with profiles for Cubase, URX, MGX, and Pro Tools. Only **Pro Tools ("Simple HUI")** sends generic MIDI; the others are proprietary Steinberg/Yamaha protocols Bitwig can't decode. We use Simple HUI — it's standard HUI underneath, which is just MIDI bytes.
 
-In Bitwig, point the CC1 controller's MIDI in/out at "CC Virtual MIDI Driver Port1" (or whichever of the 4 ports ControlCenter has the CC1 routed through).
+In Bitwig, point the CC1 controller's MIDI in/out at "CC Virtual MIDI Driver Port1". Of the 4 virtual ports ControlCenter creates, only Port1 carries data — the other three appear to be unused (in Simple HUI mode at least).
+
+**Verified**: in **Cubase profile**, no MIDI arrives on any of the 4 virtual ports. ControlCenter routes Cubase-mode traffic via a private IPC channel to its Cubase plugin, not over the public virtual ports. So the 4 multi-function knobs and 12 LCD keys (which would presumably send data in Cubase mode) remain unreachable from non-Steinberg DAWs. Don't bother re-testing this — try ControlCenter URX/MGX profiles before exhausting options, but the most likely path to unlocking those controls is a different ControlCenter profile, not script-side decoding.
 
 ## Discovered MIDI Map (Simple HUI)
 
