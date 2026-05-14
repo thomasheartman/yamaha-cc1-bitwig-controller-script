@@ -3,7 +3,7 @@
 ## Goal
 
 Replicate the Yamaha CC1's Cubase integration in Bitwig Studio, especially:
-- **AI Knob**: a single encoder that controls whatever parameter the mouse is hovering over
+- **Jog Wheel**: a single encoder that controls whatever parameter the mouse is hovering over
 - **Motorized fader**: follows selected track volume OR rides automation on any last-clicked parameter
 - **Transport**: play, stop, record, rewind, forward, loop
 - **4 knobs**: TBD (remote controls page, sends, or user-assignable)
@@ -15,7 +15,7 @@ The Bitwig Connect 4/12 controller already does the hover-parameter thing with i
 
 - USB Type-C controller. **Not directly class-compliant for MIDI** — Yamaha **ControlCenter** must be installed; it enumerates the CC1 and creates 4 virtual MIDI ports ("CC Virtual MIDI Driver Port1–4") that route to/from the hardware.
 - 1 motorized 100mm touch-sensitive fader (14-bit)
-- 1 AI Knob (relative encoder)
+- 1 Jog Wheel (relative encoder; labeled "AI Knob" on the device)
 - 1 dedicated Pan knob (relative encoder, separate from the 4 multi-function knobs)
 - 4 multi-function knobs above the LCD keys — **no MIDI in any available profile, not script-addressable**
 - 12 LCD keys — **only send OS-level keystrokes** via ControlCenter, configurable there. Not script-addressable. Map them to Bitwig keyboard shortcuts instead.
@@ -36,8 +36,10 @@ In Bitwig, point the CC1 controller's MIDI in/out at "CC Virtual MIDI Driver Por
 ### Encoders (relative)
 | Control | CC | Encoding |
 |---|---|---|
-| AI Knob | `B0 0D vv` | bit 0x40 set = +, clear = −, low 6 bits = magnitude |
+| Jog Wheel | `B0 0D vv` | bit 0x40 set = +, clear = −, low 6 bits = magnitude |
 | Pan knob | `B0 40 vv` | same |
+
+Both encoders **accelerate at speed** — magnitude is 1 at slow rates but climbs (jog wheel observed up to 5, pan similar). Any tick-handling logic that compares full delta-values across ticks will misbehave at speed; compare sign/direction instead.
 
 ### Fader (14-bit CC pair)
 - MSB: `B0 00 <msb>`
@@ -93,10 +95,10 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 
 | CC1 control | Bitwig binding |
 |---|---|
-| AI Knob (mode = zoom, default) | vertical zoom — routed by `Application.panelLayout()`: `ARRANGE` → `Arranger.zoomIn/OutLaneHeightsAll`, `EDIT` → `DetailEditor.zoomIn/OutLaneHeights`, `MIX` falls back to arranger |
-| AI Knob (mode = param) | controls last-clicked/hovered parameter |
-| AI button | toggles AI Knob mode (zoom ↔ param). Shows popup. LED on = param mode. |
-| Lock | from zoom: engages param mode + locks to hovered param. From param mode: `smartToggleLock` (re-locks to new hover if already locked). LED reflects `isLocked`. |
+| Jog Wheel (mode = jog, default) | scrubs transport position via `transport.getPosition().inc()`. Each tick advances by `SCROLL_BEATS_PER_CLICK` in the encoder direction; magnitude is ignored so fast spins don't leap. |
+| Jog Wheel (mode = param) | controls last-clicked/hovered parameter. Scaled by `PARAM_SENSITIVITY` (default 3) so ~1 full rotation goes 0→100% rather than ~2.5. |
+| AI button | toggles Jog Wheel mode (jog ↔ param). Shows popup. LED on = param mode. |
+| Lock | from jog: engages param mode + locks to hovered param. From param mode: `smartToggleLock` (re-locks to new hover if already locked). LED reflects `isLocked`. |
 | Pan knob | cursor track pan |
 | Pan click | reset pan to 0 |
 | Fader (mode = volume, default) | cursor track volume (motorized, follows track selection) |
@@ -107,7 +109,7 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 | Mute / Solo / Arm | cursor track |
 | Track Next / Prev | `cursorTrack.selectNext()` / `selectPrevious()` |
 
-### AI Knob
+### Jog Wheel
 Uses `host.createLastClickedParameter()`. The encoder sends relative CCs, so we use `param.value().inc(delta, resolution)`.
 
 ### Flush Pattern
@@ -143,7 +145,7 @@ Then add in Bitwig: Settings → Controllers → Add Controller → Yamaha → C
 1. ~~Get the CC1 hardware and connect it~~
 2. ~~MIDI discovery~~
 3. ~~Wire up controls~~
-4. **Test in Bitwig** — verify AI Knob, fader (motorized + touch), transport, mute/solo/arm, channel select, automation toggle.
+4. **Test in Bitwig** — verify Jog Wheel, fader (motorized + touch), transport, mute/solo/arm, channel select, automation toggle.
 5. **Verify motorized fader output protocol.** We're sending `B0 00 MSB` + `B0 20 LSB`. If the fader doesn't move, try pitch bend (`E0 lsb msb`) — some HUI implementations expect that.
 6. **Consider adding a fader mode toggle** (Track Volume vs Last Clicked) — Lock button is a candidate trigger.
 7. **LCD keys**: configure in ControlCenter to send F13–F24 (or other unused keys), then map those in Bitwig's keyboard shortcuts to whatever's useful.

@@ -23,13 +23,13 @@ if (host.platformIsMac()) {
 }
 
 // Flip to true to dump every incoming MIDI message to the controller console.
-const DEBUG = false;
+const DEBUG = true;
 
 // ---------------------------------------------------------------------------
 // CC1 MIDI Mapping — Simple HUI as exposed by Yamaha ControlCenter
 // ---------------------------------------------------------------------------
 // Encoders (relative): 0x40 bit set = clockwise/+, clear = counter/-, low 6 bits = magnitude.
-const CC_AI_KNOB = 0x0d;
+const CC_JOG_WHEEL = 0x0d;
 const CC_PAN_KNOB = 0x40;
 
 // 14-bit fader: paired CCs (CC 0x00 MSB + CC 0x20 LSB). The LSB arrives via
@@ -41,27 +41,22 @@ const CC_FADER_LSB = 0x20;
 const CC_HUI_ZONE = 0x0f;
 const CC_HUI_PORT = 0x2f;
 
-// Mechanical encoders bounce: a quick forward turn can briefly register a
-// reverse tick. Suppress reverses that arrive within this window of an
-// opposite-direction tick.
-const ENCODER_DEBOUNCE_MS = 80;
+const SCROLL_BEATS_PER_CLICK = 1;
+
+// Jog wheel in param mode: how many "steps" each detent moves the parameter,
+// relative to inc()'s denominator of 128. Higher = more sensitive. 1 step ≈ 0.78%
+// of the parameter range; 3 ≈ 2.3% per detent.
+const PARAM_SENSITIVITY = 3;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 let transport;
-let application;
-let arranger;
-let detailEditor;
 let cursorTrack;
 let trackVolume;
 let trackPan;
-let aiKnobParam;
+let jogWheelParam;
 let faderParam;
-
-// Tracks Bitwig's active panel layout: "ARRANGE", "EDIT", or "MIX".
-// Drives which view the AI knob zooms in zoom mode.
-let currentPanel = "ARRANGE";
 
 const BUTTONS = {}; // "zone:port" -> handler entry
 const LED_KEYS = {}; // ledKey -> {zone, port}
@@ -74,22 +69,19 @@ let lastSentFaderValue = -1;
 const ledState = {};
 let pendingLeds = {};
 
-// AI Knob mode: "zoom" = knob controls vertical (track-height) zoom of the
-// arranger, "param" = knob controls the hovered (or locked) parameter. AI
-// button toggles. Lock button engages "param" + locks in one press, or
-// smart-toggles lock when already in "param".
-let aiKnobMode = "zoom";
+// Jog wheel mode: "jog" = knob scrubs the transport position, "param" = knob
+// controls the hovered (or locked) parameter. AI button toggles. Lock button
+// engages "param" + locks in one press, or smart-toggles lock when already
+// in "param".
+let jogWheelMode = "jog";
 
 // Fader mode: "volume" = follows cursor track volume, "param" = rides the
-// last-clicked parameter (separate LastClickedParameter from the AI knob).
+// last-clicked parameter (separate LastClickedParameter from the jog wheel).
 // Automation button toggles.
 let faderMode = "volume";
 let faderParamName = ""; // cached for popup
 let volumeValue = 0; // cached current volume (so mode toggle can refresh)
 let paramValue = 0; // cached current fader-param value
-
-let lastEncoderDelta = 0;
-let lastEncoderTime = 0;
 
 // ---------------------------------------------------------------------------
 // Init
@@ -100,24 +92,18 @@ function init() {
   midiIn.setSysexCallback(onSysex);
 
   transport = host.createTransport();
-  application = host.createApplication();
-  arranger = host.createArranger();
-  detailEditor = host.createDetailEditor();
   cursorTrack = host.createCursorTrack("cc1-cursor", "CC1 Cursor", 0, 0, true);
 
-  application.panelLayout().addValueObserver(function (layout) {
-    currentPanel = layout;
-  });
   trackVolume = cursorTrack.volume();
   trackPan = cursorTrack.pan();
 
-  aiKnobParam = host.createLastClickedParameter("cc1-ai", "AI Knob");
-  aiKnobParam
+  jogWheelParam = host.createLastClickedParameter("cc1-jog", "Jog Wheel");
+  jogWheelParam
     .parameter()
     .name()
     .addValueObserver(function (name) {
       // Could push to a display later. For now just expose for debugging.
-      if (DEBUG) println("AI Knob -> " + name);
+      if (DEBUG) println("Jog Wheel -> " + name);
     });
 
   faderParam = host.createLastClickedParameter("cc1-fader", "Fader Param");
@@ -161,7 +147,7 @@ function init() {
     setLed("arm", v);
   });
 
-  aiKnobParam.isLocked().addValueObserver(function (v) {
+  jogWheelParam.isLocked().addValueObserver(function (v) {
     setLed("lock", v);
   });
 
@@ -264,8 +250,8 @@ function onMidi(status, data1, data2) {
 
 function onCC(cc, value) {
   switch (cc) {
-    case CC_AI_KNOB:
-      handleAIKnob(value);
+    case CC_JOG_WHEEL:
+      handleJogWheel(value);
       break;
     case CC_PAN_KNOB:
       handleEncoder(trackPan, value);
@@ -300,56 +286,44 @@ function handleEncoder(param, value) {
   param.value().inc(delta, 128);
 }
 
-function handleAIKnob(value) {
+function handleJogWheel(value) {
   const magnitude = value & 0x3f;
   const delta = value & 0x40 ? magnitude : -magnitude;
 
-  const now = Date.now();
-  if (
-    lastEncoderDelta * delta < 0 &&
-    now - lastEncoderTime < ENCODER_DEBOUNCE_MS
-  ) {
+  if (jogWheelMode === "param") {
+    jogWheelParam
+      .parameter()
+      .value()
+      .inc(delta * PARAM_SENSITIVITY, 128);
     return;
   }
-  lastEncoderDelta = delta;
-  lastEncoderTime = now;
 
-  if (aiKnobMode === "param") {
-    aiKnobParam.parameter().value().inc(delta, 128);
-  } else {
-    const steps = Math.abs(delta);
-    const zoomIn = delta > 0;
-    for (let i = 0; i < steps; i++) {
-      if (currentPanel === "EDIT") {
-        if (zoomIn) detailEditor.zoomInLaneHeights();
-        else detailEditor.zoomOutLaneHeights();
-      } else {
-        if (zoomIn) arranger.zoomInLaneHeightsAll();
-        else arranger.zoomOutLaneHeightsAll();
-      }
-    }
-  }
+  // Each tick advances by a fixed SCROLL_BEATS_PER_CLICK in the encoder's
+  // direction; the encoder's magnitude (it accelerates) is intentionally
+  // ignored so fast spins don't leap.
+  const step = delta > 0 ? SCROLL_BEATS_PER_CLICK : -SCROLL_BEATS_PER_CLICK;
+  transport.getPosition().inc(step);
 }
 
 function toggleAIMode() {
-  aiKnobMode = aiKnobMode === "param" ? "zoom" : "param";
-  setLed("aiMode", aiKnobMode === "param");
+  jogWheelMode = jogWheelMode === "param" ? "jog" : "param";
+  setLed("aiMode", jogWheelMode === "param");
   host.showPopupNotification(
-    "AI Knob: " +
-      (aiKnobMode === "param" ? "Hover Parameter" : "Vertical Zoom"),
+    "Jog Wheel: " +
+      (jogWheelMode === "param" ? "Hover Parameter" : "Jog Timeline"),
   );
 }
 
 function lockButton() {
-  if (aiKnobMode === "zoom") {
+  if (jogWheelMode === "jog") {
     // Engage AI + lock in one press.
-    aiKnobMode = "param";
+    jogWheelMode = "param";
     setLed("aiMode", true);
-    aiKnobParam.isLocked().set(true);
-    host.showPopupNotification("AI Knob: Locked to hovered parameter");
+    jogWheelParam.isLocked().set(true);
+    host.showPopupNotification("Jog Wheel: Locked to hovered parameter");
   } else {
     // Already in param mode — smart toggle (re-locks to new hover if already locked).
-    aiKnobParam.smartToggleLock();
+    jogWheelParam.smartToggleLock();
   }
 }
 
