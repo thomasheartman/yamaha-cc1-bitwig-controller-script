@@ -95,7 +95,7 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 
 | CC1 control | Bitwig binding |
 |---|---|
-| Jog Wheel (mode = jog, default) | scrubs transport position via `transport.getPosition().inc()`. Each tick advances by `SCROLL_BEATS_PER_CLICK` in the encoder direction; magnitude is ignored so fast spins don't leap. |
+| Jog Wheel (mode = jog, default) | scrubs the play-start position via `playStartPosition().set()` + (if playing) `jumpToPlayStartPosition()`. Pattern borrowed from DrivenByMoss — this is the API combo that reliably moves the live playhead during playback (direct `getPosition().inc()` does not). Each tick snaps to the nearest `SCROLL_BEATS_PER_CLICK` beat boundary, then advances by one step; encoder magnitude is ignored so fast spins don't leap. |
 | Jog Wheel (mode = param) | controls last-clicked/hovered parameter. Scaled by `PARAM_SENSITIVITY` (default 3) so ~1 full rotation goes 0→100% rather than ~2.5. |
 | AI button | toggles Jog Wheel mode (jog ↔ param). Shows popup. LED on = param mode. |
 | Lock | from jog: engages param mode + locks to hovered param. From param mode: `smartToggleLock` (re-locks to new hover if already locked). LED reflects `isLocked`. |

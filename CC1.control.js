@@ -83,6 +83,13 @@ let faderParamName = ""; // cached for popup
 let volumeValue = 0; // cached current volume (so mode toggle can refresh)
 let paramValue = 0; // cached current fader-param value
 
+// Cached play-start position (the "blue triangle"). The jog wheel snaps this
+// to a beat boundary and advances; jumpToPlayStartPosition() then moves the
+// live playhead. Pattern borrowed from DrivenByMoss — it's the API combo that
+// reliably scrubs during playback (direct inc() on getPosition() doesn't).
+let playStartPos = 0;
+let transportPlaying = false;
+
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
@@ -126,8 +133,13 @@ function init() {
       if (faderMode === "param" && !isFaderTouched) pendingFaderValue = val;
     });
 
+  transport.playStartPosition().addValueObserver(function (pos) {
+    playStartPos = pos;
+  });
+
   // LED observers
   transport.isPlaying().addValueObserver(function (v) {
+    transportPlaying = v;
     setLed("play", v);
   });
   transport.isArrangerRecordEnabled().addValueObserver(function (v) {
@@ -298,11 +310,20 @@ function handleJogWheel(value) {
     return;
   }
 
-  // Each tick advances by a fixed SCROLL_BEATS_PER_CLICK in the encoder's
-  // direction; the encoder's magnitude (it accelerates) is intentionally
-  // ignored so fast spins don't leap.
-  const step = delta > 0 ? SCROLL_BEATS_PER_CLICK : -SCROLL_BEATS_PER_CLICK;
-  transport.getPosition().inc(step);
+  // Snap the play-start position to the nearest beat boundary, then move by
+  // one SCROLL_BEATS_PER_CLICK in the encoder direction. Setting
+  // playStartPosition() and (if playing) calling jumpToPlayStartPosition()
+  // forces the live playhead to follow — direct inc() on getPosition() does
+  // not. Update local cache pre-write so rapid ticks compound correctly.
+  const snapped =
+    Math.round(playStartPos / SCROLL_BEATS_PER_CLICK) * SCROLL_BEATS_PER_CLICK;
+  const newPos =
+    delta > 0
+      ? snapped + SCROLL_BEATS_PER_CLICK
+      : Math.max(0, snapped - SCROLL_BEATS_PER_CLICK);
+  playStartPos = newPos;
+  transport.playStartPosition().set(newPos);
+  if (transportPlaying) transport.jumpToPlayStartPosition();
 }
 
 function toggleAIMode() {
