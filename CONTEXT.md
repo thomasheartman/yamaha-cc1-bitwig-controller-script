@@ -47,7 +47,11 @@ Both encoders **accelerate at speed** — magnitude is 1 at slow rates but climb
 - Output to the motorized fader: send the same CC pair (`B0 00 msb` + `B0 20 lsb`).
 
 ### Buttons (HUI zone/port pairs)
-`B0 0F <zone>` followed by `B0 2F <port>`. Port byte: high bit `0x40` set = press, clear = release; low 4 bits = port index. LED feedback uses the same pair with the host sending `0x40 | port` to light, `port` alone to extinguish.
+HUI is **asymmetric**:
+- **Input (device → host, button press):** `B0 0F <zone>` followed by `B0 2F <port>`.
+- **Output (host → device, LED on/off):** `B0 0C <zone>` followed by `B0 2C <port>`.
+
+Port byte: high bit `0x40` set = press/on, clear = release/off; low 4 bits = port index. Sending LED state on the input CCs (`0x0F`/`0x2F`) is silently ignored by the device — that was the original mistake that made LED feedback look broken.
 
 | Control | Zone | Port |
 |---|---|---|
@@ -76,6 +80,8 @@ The core feature. Returns an object tracking whichever parameter the user last c
 - `.isLocked()` → `SettableBooleanValue` — whether locked to current param
 - `.smartToggleLock()` — toggle lock; if already locked and mouse is on a different param, re-lock to that one
 
+**Behavior caveat (tested 2026-05-15):** despite the "last clicked OR last hovered" wording in the docs, for **native Bitwig device parameters** it's a *live* hover tracker — both `.name()` and `.exists()` drop the moment the mouse leaves the param. Clicking doesn't make it any stickier. For **third-party plugin GUIs**, by contrast, Bitwig can't see hover at all (the plugin window is opaque), so the tracker only updates on actual touch/click events via the automation-touch protocol. With no hover-end signal to clear it, the LastClickedParameter "sticks" on the last-touched plugin param — effectively giving sticky-last-touched semantics for free, but only inside plugin GUIs. DrivenByMoss uses the same API under their `IFocusedParameter` abstraction; there is no separate "last touched" API. Practical consequence: the Lock button requires the mouse to be currently over a native-device param at press time; for plugin GUIs the last-touched param is already pinned.
+
 ### `Parameter` interface
 - `.value()` → `SettableRangedValue` — normalized 0.0-1.0, supports `.set()`, `.inc()`, `.addValueObserver()`
 - `.name()` → observable string
@@ -89,16 +95,21 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 ### Transport
 `host.createTransport()` → `.play()`, `.stop()`, `.record()`, `.rewind()`, `.fastForward()`, `.toggleLoop()`, `.isPlaying()`, `.isRecording()`, etc.
 
+**Scrubbing pattern** (verified — and matches DrivenByMoss's `TransportImpl`):
+- `playStartPosition().set(beats)` then `jumpToPlayStartPosition()` is the API combo that reliably moves the live playhead. Direct `getPosition().inc()` does NOT scrub during playback — `getPosition()` and `playStartPosition()` are different concepts; the latter is what the playhead actually launches from.
+- During playback, `jumpToPlayStartPosition()` is subject to Bitwig's transport quantize (waits for next bar by default). **Workaround:** on first scrub tick while playing, call `transport.stop()`; on the last tick + a debounce window, call `transport.play()` again. While stopped, position writes are unquantized, so scrubbing feels instant and Bitwig automatically resumes from the new `playStartPosition`. We use 100ms debounce in `SCRUB_RESUME_DELAY_MS`.
+- `launchFromPlayStartPosition()` (sibling to `jumpToPlayStartPosition()`) likely is the explicitly-quantized variant — "launch" suggests clip-launch semantics. We haven't tested it.
+
 ## Architecture
 
 ### Current control bindings
 
 | CC1 control | Bitwig binding |
 |---|---|
-| Jog Wheel (mode = jog, default) | scrubs the play-start position via `playStartPosition().set()` + (if playing) `jumpToPlayStartPosition()`. Pattern borrowed from DrivenByMoss — this is the API combo that reliably moves the live playhead during playback (direct `getPosition().inc()` does not). Each tick snaps to the nearest `SCROLL_BEATS_PER_CLICK` beat boundary, then advances by one step; encoder magnitude is ignored so fast spins don't leap. |
-| Jog Wheel (mode = param) | controls last-clicked/hovered parameter. Scaled by `PARAM_SENSITIVITY` (default 3) so ~1 full rotation goes 0→100% rather than ~2.5. |
-| AI button | toggles Jog Wheel mode (jog ↔ param). Shows popup. LED on = param mode. |
-| Lock | from jog: engages param mode + locks to hovered param. From param mode: `smartToggleLock` (re-locks to new hover if already locked). LED reflects `isLocked`. |
+| Jog Wheel (mode = jog, default) | scrubs the play-start position via `playStartPosition().set()` (DrivenByMoss pattern — reliably moves the live playhead, unlike `getPosition().inc()`). To bypass Bitwig's beat-quantized jumps, the first tick while playing stops the transport; `SCRUB_RESUME_DELAY_MS` (100ms) after the last tick we restart with `transport.play()`. Each tick snaps to the nearest `SCROLL_BEATS_PER_CLICK` beat then advances by `delta * SCROLL_BEATS_PER_CLICK` (encoder accelerates 1–5 at speed, so fast spins jump multiple beats). Hold AI for fine mode = ±1 beat regardless of speed. |
+| Jog Wheel (mode = ai or lock) | controls `jogWheelParam` (the LastClickedParameter). In `ai` mode `isLocked = false`, so the param follows mouse hover. In `lock` mode `isLocked = true`, so the param is pinned to whatever was hovered when lock engaged. Both scale by `PARAM_SENSITIVITY` (default 3); hold AI for sensitivity=1 (fine). |
+| AI button | **Tap** (press → release with no jog activity): toggles between `ai` mode and `jog` mode (going to `ai` from any state, or back to `jog` if already in `ai`). **Hold** (press → jog activity → release): acts as "fine" modifier on the jog wheel — drops magnitude multiplier (jog mode = ±1 beat; ai/lock = sensitivity 1). Tap-toggle is suppressed when a hold-scrub happened. LED on = currently in `ai` mode. |
+| Lock | Toggles between `lock` mode and `jog` mode. Entering `lock` sets `jogWheelParam.isLocked(true)`, pinning to whatever the LastClickedParameter is currently tracking. **For native Bitwig device params** the mouse must be over the target at press time (the tracker drops as soon as hover ends). **For third-party plugin GUIs** the last-touched param is already pinned and persists, so the mouse can be anywhere. Refuses to enter `lock` with a popup ("nothing to lock — touch a parameter first") and a three-blink Lock LED flash when the tracker is empty. Popup includes the locked param's name on success. Mutually exclusive with `ai`. LED on = currently in `lock` mode. To re-lock to a different param: tap Lock (exit) → tap AI (follows hover) → hover new param → tap Lock. |
 | Pan knob | cursor track pan |
 | Pan click | reset pan to 0 |
 | Fader (mode = volume, default) | cursor track volume (motorized, follows track selection) |
@@ -115,15 +126,10 @@ Uses `host.createLastClickedParameter()`. The encoder sends relative CCs, so we 
 ### Flush Pattern
 Bitwig calls `flush()` when it's time to send output. We accumulate pending state (fader position, LED states) and send in `flush()` to avoid flooding MIDI output. LED state is diffed against last-sent so we don't re-transmit unchanged values.
 
-### LED feedback (verified non-functional)
-LED-output infrastructure is wired (`setLed` → diffed in `flush()` → sent as HUI zone/port pairs), but **lighting up Play/Stop/Record/Mute/Solo/Arm/Lock LEDs on the CC1 does not work** even with a 1Hz `90 00 00` ping. ControlCenter's "Simple HUI" profile evidently does not forward LED commands back to the device. The fader motor DOES respond to host output, so output isn't entirely dropped — just the LED zone/port pairs.
+### LED feedback
+LED-output infrastructure is wired (`setLed` → diffed in `flush()` → sent as HUI zone/port pairs). Earlier attempts to light LEDs failed because the script was echoing back the **input** CCs (`0x0F`/`0x2F`) — HUI uses different CCs for host→device LED messages (`0x0C`/`0x2C`). This was confirmed by reading DrivenByMoss's `HUIControlSurface.setTrigger`. The output now uses the correct CCs.
 
-Things to try if revisiting:
-- Note-based LED encoding (`90 <note> 7F` / `80 <note> 00`) used by some HUI variants.
-- Full HUI handshake SysEx instead of the simple ping.
-- Sniff what Bitwig's built-in HUI controller sends when controlling LED-lit gear, then mirror that exact byte sequence.
-
-For now, popup notifications (`host.showPopupNotification`) are the user-visible feedback for AI mode and fader mode changes.
+Popup notifications (`host.showPopupNotification`) remain useful as a secondary user-visible feedback channel for AI mode and fader mode changes.
 
 ## File Structure
 
@@ -145,10 +151,12 @@ Then add in Bitwig: Settings → Controllers → Add Controller → Yamaha → C
 1. ~~Get the CC1 hardware and connect it~~
 2. ~~MIDI discovery~~
 3. ~~Wire up controls~~
-4. **Test in Bitwig** — verify Jog Wheel, fader (motorized + touch), transport, mute/solo/arm, channel select, automation toggle.
-5. **Verify motorized fader output protocol.** We're sending `B0 00 MSB` + `B0 20 LSB`. If the fader doesn't move, try pitch bend (`E0 lsb msb`) — some HUI implementations expect that.
-6. **Consider adding a fader mode toggle** (Track Volume vs Last Clicked) — Lock button is a candidate trigger.
-7. **LCD keys**: configure in ControlCenter to send F13–F24 (or other unused keys), then map those in Bitwig's keyboard shortcuts to whatever's useful.
+4. ~~Test in Bitwig — Jog Wheel, fader (motorized + touch), transport, mute/solo/arm, channel select, automation toggle~~
+5. ~~Verify motorized fader output protocol~~ — `B0 00 MSB` + `B0 20 LSB` works.
+6. ~~Fader mode toggle (Volume / Last Clicked)~~ — wired to Automation button.
+7. ~~LED feedback~~ — works after the HUI input/output CC asymmetry was fixed.
+8. **LCD keys**: configure in ControlCenter to send F13–F24 (or other unused keys), then map those in Bitwig's keyboard shortcuts to whatever's useful.
+9. **Maybe**: long-press on Lock = `smartToggleLock` for one-press re-targeting. Skipped for now per current UX preference (toggle-only is simpler).
 
 ## Reference
 

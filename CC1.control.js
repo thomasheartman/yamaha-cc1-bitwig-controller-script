@@ -23,7 +23,7 @@ if (host.platformIsMac()) {
 }
 
 // Flip to true to dump every incoming MIDI message to the controller console.
-const DEBUG = true;
+const DEBUG = false;
 
 // ---------------------------------------------------------------------------
 // CC1 MIDI Mapping — Simple HUI as exposed by Yamaha ControlCenter
@@ -37,9 +37,14 @@ const CC_PAN_KNOB = 0x40;
 const CC_FADER_MSB = 0x00;
 const CC_FADER_LSB = 0x20;
 
-// HUI buttons: zone selector + port selector pair. Port high bit (0x40) = press.
-const CC_HUI_ZONE = 0x0f;
-const CC_HUI_PORT = 0x2f;
+// HUI buttons: zone selector + port selector pair. Asymmetric — input
+// (device → host, button press) uses 0x0F/0x2F; output (host → device, LED)
+// uses 0x0C/0x2C. Port high bit (0x40) = press/on. Sending LED state on the
+// input CCs is silently ignored by the device.
+const CC_HUI_ZONE_IN = 0x0f;
+const CC_HUI_PORT_IN = 0x2f;
+const CC_HUI_ZONE_OUT = 0x0c;
+const CC_HUI_PORT_OUT = 0x2c;
 
 const SCROLL_BEATS_PER_CLICK = 1;
 
@@ -47,6 +52,15 @@ const SCROLL_BEATS_PER_CLICK = 1;
 // relative to inc()'s denominator of 128. Higher = more sensitive. 1 step ≈ 0.78%
 // of the parameter range; 3 ≈ 2.3% per detent.
 const PARAM_SENSITIVITY = 3;
+
+// How long after the last jog-wheel tick before we resume playback. If the
+// user was playing when scrubbing began we stop on the first tick to bypass
+// Bitwig's beat quantization, then restart this many ms after the last tick.
+const SCRUB_RESUME_DELAY_MS = 250;
+
+// LED flash interval used to signal a failed Lock attempt. Six steps (on/off
+// × 3) at this interval = ~480ms total at 80ms.
+const LOCK_FAIL_FLASH_INTERVAL_MS = 80;
 
 // ---------------------------------------------------------------------------
 // State
@@ -69,10 +83,11 @@ let lastSentFaderValue = -1;
 const ledState = {};
 let pendingLeds = {};
 
-// Jog wheel mode: "jog" = knob scrubs the transport position, "param" = knob
-// controls the hovered (or locked) parameter. AI button toggles. Lock button
-// engages "param" + locks in one press, or smart-toggles lock when already
-// in "param".
+// Jog wheel mode: "jog" = knob scrubs the transport, "ai" = knob controls the
+// currently hovered parameter (follows hover), "lock" = knob controls the
+// parameter that was hovered when lock engaged (sticky). AI and Lock buttons
+// each toggle into their respective mode, or back to "jog" if already there;
+// they're mutually exclusive — entering one unlocks/exits the other.
 let jogWheelMode = "jog";
 
 // Fader mode: "volume" = follows cursor track volume, "param" = rides the
@@ -84,11 +99,33 @@ let volumeValue = 0; // cached current volume (so mode toggle can refresh)
 let paramValue = 0; // cached current fader-param value
 
 // Cached play-start position (the "blue triangle"). The jog wheel snaps this
-// to a beat boundary and advances; jumpToPlayStartPosition() then moves the
-// live playhead. Pattern borrowed from DrivenByMoss — it's the API combo that
-// reliably scrubs during playback (direct inc() on getPosition() doesn't).
+// to a beat boundary and advances. Pattern borrowed from DrivenByMoss — it's
+// the API path that reliably scrubs the live position (direct inc() on
+// getPosition() doesn't during playback).
 let playStartPos = 0;
 let transportPlaying = false;
+
+// Scrub-resume state. While scrubbing, playback is stopped to bypass Bitwig's
+// beat-quantized jumps. wasPlayingBeforeScrub remembers we owe the user a
+// resume; scrubResumeGeneration is a token that lets each new tick invalidate
+// any earlier-scheduled resume task so only the last tick's task acts.
+let wasPlayingBeforeScrub = false;
+let scrubResumeGeneration = 0;
+
+// AI button tap-vs-hold state. Tap (press → release with no jog activity)
+// toggles jog wheel mode. Hold (press → jog activity → release) acts as a
+// "fine" modifier on the jog wheel — drops the magnitude multiplier so each
+// tick is one unit (one beat in jog mode, one ×1 inc in param mode) — and
+// suppresses the mode toggle on release.
+let aiButtonHeld = false;
+let aiButtonScrubbed = false;
+
+// Cached name of jogWheelParam's tracked Parameter. Empty when nothing has
+// been clicked/hovered yet — used to refuse the Lock toggle in that case.
+let jogWheelParamName = "";
+
+// Generation token so a fresh Lock-fail flash invalidates any in-flight one.
+let lockFailFlashGeneration = 0;
 
 // ---------------------------------------------------------------------------
 // Init
@@ -109,7 +146,7 @@ function init() {
     .parameter()
     .name()
     .addValueObserver(function (name) {
-      // Could push to a display later. For now just expose for debugging.
+      jogWheelParamName = name;
       if (DEBUG) println("Jog Wheel -> " + name);
     });
 
@@ -159,10 +196,6 @@ function init() {
     setLed("arm", v);
   });
 
-  jogWheelParam.isLocked().addValueObserver(function (v) {
-    setLed("lock", v);
-  });
-
   // HUI button table (zone, port)
   defineButton(0x00, 0, onFaderTouchPress, onFaderTouchRelease);
   defineButton(
@@ -201,8 +234,8 @@ function init() {
   defineButton(0x0b, 2, function () {
     trackPan.reset();
   });
-  defineButton(0x0d, 5, toggleAIMode, null, "aiMode");
-  defineButton(0x0d, 6, lockButton, null, "lock");
+  defineButton(0x0d, 5, onAIButtonPress, onAIButtonRelease, "aiMode");
+  defineButton(0x0d, 6, toggleLockMode, null, "lock");
   defineButton(0x0e, 3, function () {
     transport.stop();
   });
@@ -271,10 +304,10 @@ function onCC(cc, value) {
     case CC_FADER_MSB:
       faderMsb = value;
       break;
-    case CC_HUI_ZONE:
+    case CC_HUI_ZONE_IN:
       currentHuiZone = value;
       break;
-    case CC_HUI_PORT:
+    case CC_HUI_PORT_IN:
       handleHuiPort(value);
       break;
   }
@@ -302,50 +335,104 @@ function handleJogWheel(value) {
   const magnitude = value & 0x3f;
   const delta = value & 0x40 ? magnitude : -magnitude;
 
-  if (jogWheelMode === "param") {
+  if (aiButtonHeld) aiButtonScrubbed = true;
+
+  if (jogWheelMode !== "jog") {
+    // "ai" and "lock" both drive jogWheelParam — the difference is whether
+    // jogWheelParam.isLocked() is true, which is owned by setJogMode.
+    const sensitivity = aiButtonHeld ? 1 : PARAM_SENSITIVITY;
     jogWheelParam
       .parameter()
       .value()
-      .inc(delta * PARAM_SENSITIVITY, 128);
+      .inc(delta * sensitivity, 128);
     return;
   }
 
-  // Snap the play-start position to the nearest beat boundary, then move by
-  // one SCROLL_BEATS_PER_CLICK in the encoder direction. Setting
-  // playStartPosition() and (if playing) calling jumpToPlayStartPosition()
-  // forces the live playhead to follow — direct inc() on getPosition() does
-  // not. Update local cache pre-write so rapid ticks compound correctly.
+  // Stop playback on the first scrub tick so position updates aren't
+  // beat-quantized. We resume SCRUB_RESUME_DELAY_MS after the last tick.
+  if (transportPlaying && !wasPlayingBeforeScrub) {
+    wasPlayingBeforeScrub = true;
+    transport.stop();
+  }
+
+  // Snap to the nearest beat then advance. The encoder accelerates at speed
+  // (delta is 1–5), so we use delta as a multiplier — fast spin = bigger jumps.
+  // Hold AI for fine mode: drops to ±1 beat per tick regardless of speed.
+  const beatsToMove = aiButtonHeld
+    ? delta > 0
+      ? SCROLL_BEATS_PER_CLICK
+      : -SCROLL_BEATS_PER_CLICK
+    : delta * SCROLL_BEATS_PER_CLICK;
   const snapped =
     Math.round(playStartPos / SCROLL_BEATS_PER_CLICK) * SCROLL_BEATS_PER_CLICK;
-  const newPos =
-    delta > 0
-      ? snapped + SCROLL_BEATS_PER_CLICK
-      : Math.max(0, snapped - SCROLL_BEATS_PER_CLICK);
+  const newPos = Math.max(0, snapped + beatsToMove);
   playStartPos = newPos;
   transport.playStartPosition().set(newPos);
-  if (transportPlaying) transport.jumpToPlayStartPosition();
+
+  // Reschedule the resume task; each new tick invalidates older ones via the
+  // generation token, so only the last tick's task actually fires play().
+  const myToken = ++scrubResumeGeneration;
+  host.scheduleTask(function () {
+    if (myToken !== scrubResumeGeneration) return;
+    if (wasPlayingBeforeScrub) {
+      wasPlayingBeforeScrub = false;
+      transport.play();
+    }
+  }, SCRUB_RESUME_DELAY_MS);
+}
+
+function onAIButtonPress() {
+  aiButtonHeld = true;
+  aiButtonScrubbed = false;
+}
+
+function onAIButtonRelease() {
+  aiButtonHeld = false;
+  if (!aiButtonScrubbed) toggleAIMode();
 }
 
 function toggleAIMode() {
-  jogWheelMode = jogWheelMode === "param" ? "jog" : "param";
-  setLed("aiMode", jogWheelMode === "param");
-  host.showPopupNotification(
-    "Jog Wheel: " +
-      (jogWheelMode === "param" ? "Hover Parameter" : "Jog Timeline"),
-  );
+  setJogMode(jogWheelMode === "ai" ? "jog" : "ai");
 }
 
-function lockButton() {
-  if (jogWheelMode === "jog") {
-    // Engage AI + lock in one press.
-    jogWheelMode = "param";
-    setLed("aiMode", true);
-    jogWheelParam.isLocked().set(true);
-    host.showPopupNotification("Jog Wheel: Locked to hovered parameter");
-  } else {
-    // Already in param mode — smart toggle (re-locks to new hover if already locked).
-    jogWheelParam.smartToggleLock();
+function toggleLockMode() {
+  if (jogWheelMode === "lock") {
+    setJogMode("jog");
+    return;
   }
+  if (!jogWheelParamName) {
+    host.showPopupNotification(
+      "Jog Wheel: nothing to lock — touch a parameter first",
+    );
+    flashLockFail();
+    return;
+  }
+  setJogMode("lock");
+}
+
+function flashLockFail() {
+  const myToken = ++lockFailFlashGeneration;
+  // Six toggles = three on/off cycles, ending off.
+  for (let i = 0; i < 6; i++) {
+    const on = i % 2 === 0;
+    host.scheduleTask(function () {
+      if (myToken !== lockFailFlashGeneration) return;
+      setLed("lock", on);
+    }, i * LOCK_FAIL_FLASH_INTERVAL_MS);
+  }
+}
+
+function setJogMode(newMode) {
+  jogWheelMode = newMode;
+  jogWheelParam.isLocked().set(newMode === "lock");
+  setLed("aiMode", newMode === "ai");
+  setLed("lock", newMode === "lock");
+  const labels = {
+    jog: "Jog Timeline",
+    ai: "Hover Parameter",
+    lock: "Locked to " + (jogWheelParamName || "parameter"),
+  };
+  host.showPopupNotification("Jog Wheel: " + labels[newMode]);
 }
 
 function handleFaderLSB(lsb) {
@@ -417,8 +504,8 @@ function flush() {
     if (ledState[ledKey] === on) continue;
     const btn = LED_KEYS[ledKey];
     if (!btn) continue;
-    sendMidi(0xb0, CC_HUI_ZONE, btn.zone);
-    sendMidi(0xb0, CC_HUI_PORT, btn.port | (on ? 0x40 : 0));
+    sendMidi(0xb0, CC_HUI_ZONE_OUT, btn.zone);
+    sendMidi(0xb0, CC_HUI_PORT_OUT, btn.port | (on ? 0x40 : 0));
     ledState[ledKey] = on;
   }
   pendingLeds = {};
