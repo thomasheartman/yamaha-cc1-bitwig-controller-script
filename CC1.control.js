@@ -78,6 +78,9 @@ const LED_KEYS = {}; // ledKey -> {zone, port}
 let currentHuiZone = 0;
 let faderMsb = 0;
 let isFaderTouched = false;
+// The Parameter we called touch(true) on, so the matching touch(false) goes
+// to the same one even if faderMode flipped while the fader was held.
+let touchedParam = null;
 let pendingFaderValue = -1;
 let lastSentFaderValue = -1;
 const ledState = {};
@@ -173,6 +176,9 @@ function init() {
   transport.playStartPosition().addValueObserver(function (pos) {
     playStartPos = pos;
   });
+  // Mark-interested (no callback) so transport.getPosition().get() returns a
+  // live value when scrubbing seeds playStartPos from the moving playhead.
+  transport.getPosition().markInterested();
 
   // LED observers
   transport.isPlaying().addValueObserver(function (v) {
@@ -238,6 +244,9 @@ function init() {
   defineButton(0x0d, 6, toggleLockMode, null, "lock");
   defineButton(0x0e, 3, function () {
     transport.stop();
+    // Cancel any pending scrub-resume so a user-initiated stop sticks.
+    wasPlayingBeforeScrub = false;
+    scrubResumeGeneration++;
   });
   defineButton(
     0x0e,
@@ -334,6 +343,7 @@ function handleEncoder(param, value) {
 function handleJogWheel(value) {
   const magnitude = value & 0x3f;
   const delta = value & 0x40 ? magnitude : -magnitude;
+  if (delta === 0) return;
 
   if (aiButtonHeld) aiButtonScrubbed = true;
 
@@ -350,8 +360,11 @@ function handleJogWheel(value) {
 
   // Stop playback on the first scrub tick so position updates aren't
   // beat-quantized. We resume SCRUB_RESUME_DELAY_MS after the last tick.
+  // Seed playStartPos from the live playhead so scrubbing grabs the moving
+  // position rather than the (frozen) blue triangle from when play began.
   if (transportPlaying && !wasPlayingBeforeScrub) {
     wasPlayingBeforeScrub = true;
+    playStartPos = transport.getPosition().get();
     transport.stop();
   }
 
@@ -451,12 +464,16 @@ function activeFaderParam() {
 
 function onFaderTouchPress() {
   isFaderTouched = true;
-  activeFaderParam().touch(true);
+  touchedParam = activeFaderParam();
+  touchedParam.touch(true);
 }
 
 function onFaderTouchRelease() {
   isFaderTouched = false;
-  activeFaderParam().touch(false);
+  if (touchedParam) {
+    touchedParam.touch(false);
+    touchedParam = null;
+  }
 }
 
 function toggleFaderMode() {
