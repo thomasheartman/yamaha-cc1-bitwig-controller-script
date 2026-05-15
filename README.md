@@ -136,7 +136,7 @@ Popup notifications (`host.showPopupNotification`) remain useful as a secondary 
 ```
 bitwig-controller-script/
 ├── CC1.control.js          # Main controller script — place in ~/Documents/Bitwig Studio/Controller Scripts/Yamaha/
-└── CONTEXT.md              # This file — project context and notes
+└── README.md               # This file — project context and notes
 ```
 
 The script is a single `.control.js` file. No build step needed. To install:
