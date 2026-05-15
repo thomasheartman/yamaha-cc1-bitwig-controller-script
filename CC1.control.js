@@ -4,7 +4,7 @@
 // Connect via "CC Virtual MIDI Driver Port1" (or whichever virtual port the
 // CC1 is routed to in ControlCenter).
 
-loadAPI(20);
+loadAPI(25);
 host.setShouldFailOnDeprecatedUse(true);
 
 host.defineController(
@@ -46,7 +46,33 @@ const CC_HUI_PORT_IN = 0x2f;
 const CC_HUI_ZONE_OUT = 0x0c;
 const CC_HUI_PORT_OUT = 0x2c;
 
-const SCROLL_BEATS_PER_CLICK = 1;
+// Zoom-aware jog wheel step sizes, ported from DrivenByMoss's TransportImpl
+// with all step sizes shifted up by one row — DrivenByMoss's original values
+// felt too fine at every zoom level in Bitwig. Now each threshold gets the
+// step size that the threshold below it had originally.
+// Key: 1 / contentPerPixel threshold. Value: step size in BARS — each detent
+// moves `value * beatsPerBar` beats in default mode. Sorted ascending; lookup
+// returns the first entry whose threshold exceeds the current
+// inverse-contentPerPixel. Zoomed out → low threshold → big step (1 bar).
+// Zoomed in → high threshold → tiny step (1/32768 bar).
+const ZOOM_RESOLUTIONS = [
+  [27.94, 1.0],
+  [279.11, 1.0 / 4],
+  [661.61, 1.0 / 16],
+  [1176.2, 1.0 / 32],
+  [2091.03, 1.0 / 64],
+  [4956.52, 1.0 / 128],
+  [8811.59, 1.0 / 256],
+  [20886.75, 1.0 / 512],
+  [37132.0, 1.0 / 1024],
+  [66012.45, 1.0 / 2048],
+  [156473.96, 1.0 / 4096],
+  [278175.93, 1.0 / 8192],
+  [600000, 1.0 / 16384],
+  [800000, 1.0 / 32768],
+];
+// Fallback resolution when zoom is beyond the table (extreme zoom-in).
+const ZOOM_RESOLUTION_FLOOR = 1.0 / 32768;
 
 // Jog wheel in param mode: how many "steps" each detent moves the parameter,
 // relative to inc()'s denominator of 128. Higher = more sensitive. 1 step ≈ 0.78%
@@ -71,6 +97,7 @@ let trackVolume;
 let trackPan;
 let jogWheelParam;
 let faderParam;
+let arranger;
 
 const BUTTONS = {}; // "zone:port" -> handler entry
 const LED_KEYS = {}; // ledKey -> {zone, port}
@@ -179,6 +206,14 @@ function init() {
   // Mark-interested (no callback) so transport.getPosition().get() returns a
   // live value when scrubbing seeds playStartPos from the moving playhead.
   transport.getPosition().markInterested();
+
+  // Zoom-aware scrub: Arranger's horizontal scrollbar exposes contentPerPixel,
+  // which we use to size each jog tick to the visible zoom level. Time
+  // signature feeds the bar multiplier for the default (coarse) jog step.
+  arranger = host.createArranger();
+  arranger.getHorizontalScrollbarModel().getContentPerPixel().markInterested();
+  transport.timeSignature().numerator().markInterested();
+  transport.timeSignature().denominator().markInterested();
 
   // LED observers
   transport.isPlaying().addValueObserver(function (v) {
@@ -340,6 +375,30 @@ function handleEncoder(param, value) {
   param.value().inc(delta, 128);
 }
 
+function getZoomResolution() {
+  const contentPerPixel = arranger
+    .getHorizontalScrollbarModel()
+    .getContentPerPixel()
+    .get();
+  if (contentPerPixel <= 0) return 1.0;
+  const inversed = 1 / contentPerPixel;
+  // 1-bar tier (most zoomed out): time-signature aware, so it can't be a
+  // static table entry. Checked before the table since its threshold is the
+  // lowest.
+  if (inversed < 2.2) return getBeatsPerBar();
+  for (let i = 0; i < ZOOM_RESOLUTIONS.length; i++) {
+    if (inversed < ZOOM_RESOLUTIONS[i][0]) return ZOOM_RESOLUTIONS[i][1];
+  }
+  return ZOOM_RESOLUTION_FLOOR;
+}
+
+function getBeatsPerBar() {
+  const num = transport.timeSignature().numerator().get();
+  const den = transport.timeSignature().denominator().get();
+  if (den <= 0) return 4;
+  return (4 * num) / den;
+}
+
 function handleJogWheel(value) {
   const magnitude = value & 0x3f;
   const delta = value & 0x40 ? magnitude : -magnitude;
@@ -368,16 +427,18 @@ function handleJogWheel(value) {
     transport.stop();
   }
 
-  // Snap to the nearest beat then advance. The encoder accelerates at speed
-  // (delta is 1–5), so we use delta as a multiplier — fast spin = bigger jumps.
-  // Hold AI for fine mode: drops to ±1 beat per tick regardless of speed.
+  // Step size scales with the arranger's zoom level (resolution shrinks as
+  // you zoom in). Default jog step is one bar; AI-held drops to the raw
+  // resolution (a single grid cell at the current zoom) and ignores encoder
+  // acceleration. Snap to the chosen fraction before advancing.
+  const resolution = getZoomResolution();
+  const fraction = aiButtonHeld ? resolution : resolution * getBeatsPerBar();
   const beatsToMove = aiButtonHeld
     ? delta > 0
-      ? SCROLL_BEATS_PER_CLICK
-      : -SCROLL_BEATS_PER_CLICK
-    : delta * SCROLL_BEATS_PER_CLICK;
-  const snapped =
-    Math.round(playStartPos / SCROLL_BEATS_PER_CLICK) * SCROLL_BEATS_PER_CLICK;
+      ? fraction
+      : -fraction
+    : delta * fraction;
+  const snapped = Math.round(playStartPos / fraction) * fraction;
   const newPos = Math.max(0, snapped + beatsToMove);
   playStartPos = newPos;
   transport.playStartPosition().set(newPos);
