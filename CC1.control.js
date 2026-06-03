@@ -311,6 +311,11 @@ function init() {
     "loop",
   );
   defineButton(0x19, 2, toggleFaderMode);
+  // The automation button reports input as HUI STATUS_AUTO (zone 0x19 / port 2),
+  // but its LED is decoupled: the W (Write) key lamp is wired to the channel-1
+  // strip AUTO lamp at zone 0x00 / port 4 (HUI_AUTO1) — found empirically with
+  // the LED probe. The R (Read) key has no host-addressable lamp in Simple HUI.
+  LED_KEYS["writeAuto"] = { zone: 0x00, port: 4 };
 
   println("Yamaha CC1 initialized.");
 }
@@ -544,6 +549,10 @@ function toggleFaderMode() {
   // whatever was last hovered/clicked — which is what you want if a parameter
   // happened to be under the mouse when the button was pressed.
   faderParam.isLocked().set(faderMode === "param");
+
+  // Light the Write Automation ("W") key while the fader is riding the
+  // last-touched parameter; dark when it's back on track volume.
+  setLed("writeAuto", faderMode === "param");
 
   if (!isFaderTouched) {
     pendingFaderValue = faderMode === "volume" ? volumeValue : paramValue;

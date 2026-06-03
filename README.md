@@ -70,6 +70,8 @@ Port byte: high bit `0x40` set = press/on, clear = release/off; low 4 bits = por
 | Loop | 0x0F | 3 |
 | Automation (read = write) | 0x19 | 2 |
 
+**LED output addresses don't always match the input address**, and the CC1's lamp routing does **not** follow the HUI spec — treat the spec as a hint, not ground truth. The Automation button *reports input* at zone `0x19`/port 2, but its **W (Write) key LED is wired to the channel-1 strip AUTO lamp at zone `0x00`/port 4** (alongside mute/solo/arm at `0x00`/2,3,7). The HUI-spec auto-mode LED addresses (`0x18`/2 for read, `0x18`/4 for write) are dead on this device — verified by sweeping. The **R (Read) key has no host-addressable LED** in Simple HUI. When a lamp won't light, sweep the whole space empirically (see "LED feedback" below) rather than trusting the spec.
+
 ## Key Bitwig API (v20+)
 
 ### `host.createLastClickedParameter(id, name)` → `LastClickedParameter`
@@ -115,7 +117,7 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 | Fader (mode = volume, default) | cursor track volume (motorized, follows track selection) |
 | Fader (mode = param) | rides the parameter that was last hovered/clicked at the moment the mode was engaged. Locked — does not follow further hovers until mode is toggled. |
 | Fader touch | calls `.touch(true/false)` on whichever parameter the fader is currently bound to |
-| Automation button | toggles fader mode (volume ↔ param). Shows popup with the riding param's name. Read/Write Auto are the same physical MIDI code, so both keys do this. |
+| Automation button | toggles fader mode (volume ↔ param). Shows popup with the riding param's name. Read/Write Auto are the same physical MIDI code, so both keys do this. The **W (Write) key LED lights while the fader is riding a parameter** (param mode) and is dark in volume mode. |
 | Play / Stop / Record / Loop | transport |
 | Mute / Solo / Arm | cursor track |
 | Track Next / Prev | `cursorTrack.selectNext()` / `selectPrevious()` |
@@ -130,6 +132,8 @@ Bitwig calls `flush()` when it's time to send output. We accumulate pending stat
 LED-output infrastructure is wired (`setLed` → diffed in `flush()` → sent as HUI zone/port pairs). Earlier attempts to light LEDs failed because the script was echoing back the **input** CCs (`0x0F`/`0x2F`) — HUI uses different CCs for host→device LED messages (`0x0C`/`0x2C`). This was confirmed by reading DrivenByMoss's `HUIControlSurface.setTrigger`. The output now uses the correct CCs.
 
 Popup notifications (`host.showPopupNotification`) remain useful as a secondary user-visible feedback channel for AI mode and fader mode changes.
+
+**Finding a lamp's address empirically:** the CC1 does not light every HUI address, and the ones it does light don't always match the spec or the button's own input address (the W-key LED is the prime example — see the MIDI map above). When a new lamp won't respond, sweep for it: temporarily route the jog wheel to step a single linear HUI index across the whole space (`zone = index >> 3`, `port = index & 7`), lighting one address at a time and showing it in a popup, and spin until the target key lights. This is how the W-key lamp (`0x00`/4) was found after the spec-derived addresses all came up dead. The probe code isn't kept in the script — re-add it behind a flag when needed.
 
 ## File Structure
 
