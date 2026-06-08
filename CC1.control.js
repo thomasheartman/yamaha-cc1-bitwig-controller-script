@@ -88,10 +88,17 @@ const SCRUB_RESUME_DELAY_MS = 250;
 // × 3) at this interval = ~480ms total at 80ms.
 const LOCK_FAIL_FLASH_INTERVAL_MS = 80;
 
+// Gap between the steps of a record-restart (stop → undo → record). The steps
+// are queued into the engine, so we space them: stop() must finalize the take
+// into an undoable action before undo() can target it, and undo() must settle
+// before record() re-arms. Mirrors DrivenByMoss's 100ms stop→rewind settle.
+const RECORD_RESTART_DELAY_MS = 100;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 let transport;
+let application;
 let cursorTrack;
 let trackVolume;
 let trackPan;
@@ -134,6 +141,10 @@ let paramValue = 0; // cached current fader-param value
 // getPosition() doesn't during playback).
 let playStartPos = 0;
 let transportPlaying = false;
+// Cached arranger record-enable state. Combined with transportPlaying it tells
+// us a recording is rolling (count-in or actual capture), which the record
+// button uses to decide between a normal toggle and a restart-the-take.
+let recordEnabled = false;
 
 // Scrub-resume state. While scrubbing, playback is stopped to bypass Bitwig's
 // beat-quantized jumps. wasPlayingBeforeScrub remembers we owe the user a
@@ -166,6 +177,7 @@ function init() {
   midiIn.setSysexCallback(onSysex);
 
   transport = host.createTransport();
+  application = host.createApplication();
   cursorTrack = host.createCursorTrack("cc1-cursor", "CC1 Cursor", 0, 0, true);
 
   trackVolume = cursorTrack.volume();
@@ -221,6 +233,7 @@ function init() {
     setLed("play", v);
   });
   transport.isArrangerRecordEnabled().addValueObserver(function (v) {
+    recordEnabled = v;
     setLed("record", v);
   });
   transport.isArrangerLoopEnabled().addValueObserver(function (v) {
@@ -292,15 +305,7 @@ function init() {
     null,
     "play",
   );
-  defineButton(
-    0x0e,
-    5,
-    function () {
-      transport.record();
-    },
-    null,
-    "record",
-  );
+  defineButton(0x0e, 5, onRecordPress, null, "record");
   defineButton(
     0x0f,
     3,
@@ -458,6 +463,43 @@ function handleJogWheel(value) {
       transport.play();
     }
   }, SCRUB_RESUME_DELAY_MS);
+}
+
+// Record button. Normally a plain transport.record() toggle. But if a
+// recording is already rolling (arranger record enabled + transport playing —
+// covers both count-in and live capture), pressing record restarts the take
+// from the same spot instead: stop, then re-record. transport.stop() returns
+// the playhead to the take's start, so record() picks up from the same place.
+//
+// If actual capture has begun we also undo the take we just stopped, so the
+// retake replaces it rather than stacking. "Capture has begun" = the playhead
+// has reached or passed the play-start anchor (the blue triangle); during
+// pre-roll/count-in the playhead sits below the anchor and nothing is recorded
+// yet, so we skip the undo and just relaunch with a fresh count-in.
+//
+// Caveat (accepted tradeoff): if a clip-launcher recording is running at the
+// same time as arranger record, the undo targets both — there's no cheap way
+// to detect active clip recording, so we don't special-case it.
+function onRecordPress() {
+  const recordingInProgress = recordEnabled && transportPlaying;
+  if (!recordingInProgress) {
+    transport.record();
+    return;
+  }
+
+  const capturedSomething = transport.getPosition().get() >= playStartPos;
+  transport.stop();
+  if (capturedSomething) {
+    host.scheduleTask(function () {
+      application.undo();
+    }, RECORD_RESTART_DELAY_MS);
+  }
+  host.scheduleTask(
+    function () {
+      transport.record();
+    },
+    capturedSomething ? 2 * RECORD_RESTART_DELAY_MS : RECORD_RESTART_DELAY_MS,
+  );
 }
 
 function onAIButtonPress() {

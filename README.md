@@ -102,6 +102,11 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 - During playback, `jumpToPlayStartPosition()` is subject to Bitwig's transport quantize (waits for next bar by default). **Workaround:** on first scrub tick while playing, call `transport.stop()`; on the last tick + a debounce window, call `transport.play()` again. While stopped, position writes are unquantized, so scrubbing feels instant and Bitwig automatically resumes from the new `playStartPosition`. We use 100ms debounce in `SCRUB_RESUME_DELAY_MS`.
 - `launchFromPlayStartPosition()` (sibling to `jumpToPlayStartPosition()`) likely is the explicitly-quantized variant — "launch" suggests clip-launch semantics. We haven't tested it.
 
+**Detecting an in-progress recording / count-in** (used by the Record restart-the-take, verified against the API sources + DrivenByMoss): there is **no** transport-level "actively capturing" boolean. `isArrangerRecordEnabled()` is just the record *arm* state (true through count-in too) and `isPlaying()` is *also* true during count-in, so neither distinguishes count-in from real capture. The reliable signal is **position vs. the play-start anchor**: during pre-roll/count-in the live `getPosition()` sits *below* `playStartPosition()` (the blue triangle), and crosses it exactly when capture begins. So "a recording is rolling" = `isArrangerRecordEnabled() && isPlaying()`, and "something was actually captured" = `getPosition() >= playStartPosition()`. (A true per-take boolean, `ClipLauncherSlot.isRecording()`, exists only for *clip-launcher* recording, not the arranger; and there's no global aggregate of it.)
+
+### `host.createApplication()` → `Application`
+- `.undo()` / `.redo()` — generic, no args; undoes the *last* undoable action (so the Record retake's undo can hit a concurrent clip take). `createApplicationSection()` is the deprecated variant — use `createApplication()`.
+
 ## Architecture
 
 ### Current control bindings
@@ -118,7 +123,8 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 | Fader (mode = param) | rides the parameter that was last hovered/clicked at the moment the mode was engaged. Locked — does not follow further hovers until mode is toggled. |
 | Fader touch | calls `.touch(true/false)` on whichever parameter the fader is currently bound to |
 | Automation button | toggles fader mode (volume ↔ param). Shows popup with the riding param's name. Read/Write Auto are the same physical MIDI code, so both keys do this. The **W (Write) key LED lights while the fader is riding a parameter** (param mode) and is dark in volume mode. |
-| Play / Stop / Record / Loop | transport |
+| Play / Stop / Loop | transport |
+| Record | Normally `transport.record()`. **Restart-the-take:** if a recording is already rolling (arranger record enabled + transport playing), pressing Record stops and re-records from the same spot instead — `transport.stop()` returns the playhead to the take's start, then `record()` relaunches. If actual capture has begun it also `application.undo()`s the take just stopped so the retake replaces it rather than stacking; during count-in (playhead still below the play-start anchor, so nothing recorded yet) it skips the undo and just restarts with a fresh count-in. Steps are spaced by `RECORD_RESTART_DELAY_MS` (100ms) since they're engine-queued. Tradeoff: a simultaneous clip-launcher recording is undone too — there's no cheap way to detect active clip recording. |
 | Mute / Solo / Arm | cursor track |
 | Track Next / Prev | `cursorTrack.selectNext()` / `selectPrevious()` |
 
