@@ -17,8 +17,8 @@ The Bitwig Connect 4/12 controller already does the hover-parameter thing with i
 - 1 motorized 100mm touch-sensitive fader (14-bit)
 - 1 Jog Wheel (relative encoder; labeled "AI Knob" on the device)
 - 1 dedicated Pan knob (relative encoder, separate from the 4 multi-function knobs)
-- 4 multi-function knobs above the LCD keys — **no MIDI in any available profile, not script-addressable**
-- 12 LCD keys — **only send OS-level keystrokes** via ControlCenter, configurable there. Not script-addressable. Map them to Bitwig keyboard shortcuts instead.
+- 4 multi-function knobs above the LCD keys — no MIDI in any profile, but **reachable through the ControlCenter plugin bus** (see below). Labelled TYPE, F, Q, G left to right.
+- 12 LCD keys — no MIDI. Either OS-level keystrokes via ControlCenter, or handed to the Stream Deck app by the `sdlink` bridge, or **reachable through the plugin bus**.
 - Transport: Play, Stop, Record, Loop. **No Rewind/Forward in Simple HUI** mode.
 - Edit buttons: Pan click, AI button, Lock, Channel Next/Prev, Mute, Solo, Arm, Read/Write Automation (collide — same MIDI code)
 - Monitor button and Jog button send nothing in Simple HUI.
@@ -29,7 +29,83 @@ ControlCenter ships with profiles for Cubase, URX, MGX, and Pro Tools. Only **Pr
 
 In Bitwig, point the CC1 controller's MIDI in/out at "CC Virtual MIDI Driver Port1". Of the 4 virtual ports ControlCenter creates, only Port1 carries data — the other three appear to be unused (in Simple HUI mode at least).
 
-**Verified**: in **Cubase profile**, no MIDI arrives on any of the 4 virtual ports. ControlCenter routes Cubase-mode traffic via a private IPC channel to its Cubase plugin, not over the public virtual ports. So the 4 multi-function knobs and 12 LCD keys (which would presumably send data in Cubase mode) remain unreachable from non-Steinberg DAWs. Don't bother re-testing this — try ControlCenter URX/MGX profiles before exhausting options, but the most likely path to unlocking those controls is a different ControlCenter profile, not script-side decoding.
+**Verified**: in **Cubase profile**, no MIDI arrives on any of the 4 virtual ports — not even sysex (the script registers `setSysexCallback`, so nothing is being silently dropped). ControlCenter routes Cubase-mode traffic over a private channel to its Cubase plugin. There is nothing on the MIDI bus to intercept, so don't go hunting for it.
+
+That private channel turned out to be the way in anyway — see below. The controls that Simple HUI can't see are reached by writing a ControlCenter plugin, not by decoding MIDI.
+
+## ControlCenter's plugin bus
+
+**ControlCenter (v5.0.0) is a near-verbatim clone of the Elgato Stream Deck plugin SDK.** This is the single most useful fact about the device. Plugins are separate processes launched by ControlCenter with:
+
+```
+<plugin-binary> -port 52832 -pluginUUID com.thomas.bitwig \
+  -registerEvent registerPlugin -info '{...}' -hostID ControlCenter
+```
+
+They connect to `ws://127.0.0.1:<port>` and send `{"event":"registerPlugin","uuid":"<pluginUUID>"}`. After that it's Stream Deck's event vocabulary verbatim. The CC1's knobs are, at the protocol level, Stream Deck + dials.
+
+**ControlCenter loads unsigned third-party plugins.** A Node script with a `#!/usr/bin/env node` shebang works; there is no code-signature check, and the plugin directory is user-writable. Yamaha's own plugins are signed, but that isn't enforced on ours.
+
+### Plugin layout
+
+`~/Library/Application Support/yamaha/ControlCenter/Plugins/<uuid>.ypPlugin/`, containing a `manifest.json` (`"sdk": 2`, `platforms.macos.main` naming the executable, and an `actions[]` array where each action declares a `uuid`, `states[].image`, and which `controls` types it accepts) plus that executable. Yamaha's plugins keep their property-inspector HTML/JS unminified under `source/`, which is the closest thing to documentation that exists.
+
+### Inbound events (device → plugin) — all verified on hardware
+
+| Event | Payload | Notes |
+|---|---|---|
+| `deviceDidConnect` | `controls[]`, `device` | Full inventory of every slot, as `{type, column, row}` |
+| `willAppear` / `willDisappear` | `control`, `instanceUUID`, `actionUUID` | The **only** time coordinates are sent; everything after is identified by `instanceUUID` |
+| `dialRotate` | `{ticks, pressed}` | `ticks` is **signed and pre-accumulated** (−4…+3 observed) — no HUI sign-bit unpacking. `pressed` gives a free shift modifier per knob |
+| `dialDown` / `dialUp` | `{}` | The knobs click |
+| `keyDown` / `keyUp` | `{}` | LCD keys and lit buttons alike |
+| `sliderMove` | `{position}` | Normalised float, e.g. `0.5620723366737366` — not a 14-bit CC pair |
+| `sliderPress` / `sliderRelease` | `{}` | The fader's touch sensor |
+
+### Outbound events — do not work
+
+`setTitle`, `setState` and `setFeedback` were all sent, with both `context` and `instanceUUID` as the id key (both strings appear in the binary). The host accepted every frame without error or disconnect and **nothing happened**: no key text, no LEDs, no fader movement. Key visuals appear to come from the profile's static `states[].image`, not from anything sent at runtime.
+
+So treat the plugin bus as **input-only**. LED feedback and the motorised fader still work — over HUI, on the MIDI port, exactly as before. The two channels coexist happily.
+
+### What the plugin bus cannot reach
+
+`pan` (rotate *and* press), `lock`, **jog-wheel press**, and the prev/next-profile buttons deliver nothing to plugins, even when bound to a plugin action. ControlCenter keeps them. All except jog-wheel press still work over HUI, so bind those slots to `com.yamaha.hui.*` and let the existing MIDI path handle them.
+
+Note that `jog` and `monitoring` are typed `LEDKeyPad`, so the hardware does have lamps behind them — but HUI has no address for either (found by sweeping, same as the R key) and plugin output is ignored, so **they are permanently dark**. Only use them for stateless actions.
+
+## Profile format
+
+ControlCenter's UI cannot create or edit profiles, so `cc-plugin/install-profile.py` writes them directly. Everything is plain JSON and a plist; all of it is user-writable.
+
+```
+~/Library/Application Support/yamaha/ControlCenter/
+├── Plugins/<uuid>.ypPlugin/          # plugin code
+├── MasterProfiles/CC1/<uuid>/        # catalogue per model — the UI lists from here
+└── Profiles/<device-uuid>/Factory/<uuid>/
+    ├── manifest.json                 # device-level controls
+    └── Profiles/<page-uuid>/manifest.json   # per-page controls (the 12 LCD keys)
+```
+
+A profile must exist in **both** `MasterProfiles` and `Profiles` (under different UUIDs) or it won't appear in the UI. Miss the page manifest and ControlCenter logs `[PageProfile::apply] Failed to open manifest file`, applies the bindings, then immediately tears them down again.
+
+Bindings are per-slot, and a slot can point at **any plugin's action** — that's what makes hybrids possible. Slot names, harvested from the factory profiles and `strings` on the ControlCenter binary:
+
+| Controller type | Slot names |
+|---|---|
+| `Knob` (6) | `type`, `f`, `q`, `g` (top row, left to right = columns 0–3), `pan`, `jog-wheel` |
+| `KeyPad` (12) | `lcd-0-0` … `lcd-2-3` — the LCD keys, page-level |
+| `LEDKeyPad` (16) | `ai`, `channel-select-left`, `channel-select-right`, `jog`, `lock`, `loop`, `monitoring`, `mute`, `pause`, `pedal-switch`, `play`, `read`, `record`, `record-enable`, `solo`, `write` |
+| `SmartSlider` / `Slider` | `fader-1` / `pedal-volume` |
+
+Other fields that matter:
+
+- **`FolderName` is the UI's category tab**, and the UI only has the four Yamaha ones — a custom category never appears. Ours says `Pro Tools`.
+- `~/Library/Preferences/com.yamaha.ControlCenter.plist` holds `devices.<id>.profileUUID` (the active profile) and `ProfileEnabledFlags` (which profiles the device's prev/next-profile buttons cycle through). ControlCenter rewrites this on quit, so edit it while the app is stopped, and go through `defaults import` rather than writing the file — otherwise cfprefsd overwrites you from its cache.
+- There is **no `switchToProfile`** — Yamaha dropped that part of the SDK, so a plugin cannot change profiles. Switching is manual, via the UI or the device's profile buttons.
+- The `sdlink` bridge advertises the CC1 to the Stream Deck app as a **keys-only device** (12 keys, like a Stream Deck MK.2). Binding a `Knob` slot to `com.yamaha.controlcenter.sdlink.sdlink` does nothing — the app has no dial slots. Tested.
+
+Careful: killing ControlCenter means `/Applications/ControlCenter.app`, **never** Apple's `/System/Library/CoreServices/ControlCenter.app`.
 
 ## Discovered MIDI Map (Simple HUI)
 
@@ -109,6 +185,25 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 
 ## Architecture
 
+The CC1 reaches Bitwig over **two** MIDI inputs:
+
+1. **`CC Virtual MIDI Driver Port1`** — HUI, produced by Yamaha's own plugin. Transport, fader (in and motorised out), pan, lock, mute/solo/arm, jog wheel, LED feedback. Unchanged from before.
+2. **`CC1 Knobs`** — a virtual CoreMIDI source published by our ControlCenter plugin in `cc-plugin/`, carrying the 4 knobs and the jog/monitor buttons. Channel 16 (`0xBF`) so it can never collide with HUI's channel 1.
+
+| Control | CC | Value |
+|---|---|---|
+| Knobs TYPE, F, Q, G | `0x10`–`0x13` | `64 + ticks`, clamped to 1…127 (Bitwig calls this Relative Bin Offset) |
+| Knob press | `0x14`–`0x17` | 127 down, 0 up |
+| jog / monitor buttons | `0x18` / `0x19` | 127 down, 0 up |
+
+The active ControlCenter profile is a **verbatim clone of `Pro Tools / Stream Deck Link`** with the empty slots filled in: the 4 knobs and the `jog`/`monitoring` buttons point at our plugin, and every other slot stays on `com.yamaha.hui.*` / `sdlink` exactly as Yamaha shipped it. That's why HUI keeps working untouched.
+
+**Gotchas:**
+
+- Our plugin only receives events **while our profile is active**. Switch the CC1 to a Cubase profile and the knobs go quiet — that is the first thing to check when they stop working.
+- The `CC1 Knobs` port only exists while ControlCenter is running, so auto-discovery can fail if Bitwig starts first. Pick the ports by hand once and Bitwig remembers.
+- `defineMidiPorts` is read when Bitwig **scans scripts at launch**. Changing the port count needs a full Bitwig restart; removing and re-adding the controller is not enough, and you'll get `Invalid MIDI port index` until you do.
+
 ### Current control bindings
 
 | CC1 control | Bitwig binding |
@@ -127,6 +222,10 @@ Follows the selected track. `.volume()`, `.pan()`, `.mute()`, `.solo()`, `.arm()
 | Record | Normally `transport.record()`. **Restart-the-take:** if a recording is already rolling (arranger record enabled + transport playing), pressing Record stops and re-records from the same spot instead — `transport.stop()` returns the playhead to the take's start, then `record()` relaunches. If actual capture has begun it also `application.undo()`s the take just stopped so the retake replaces it rather than stacking; during count-in (playhead still below the play-start anchor, so nothing recorded yet) it skips the undo and just restarts with a fresh count-in. Steps are spaced by `RECORD_RESTART_DELAY_MS` (100ms) since they're engine-queued. Tradeoff: a simultaneous clip-launcher recording is undone too — there's no cheap way to detect active clip recording. |
 | Mute / Solo / Arm | cursor track |
 | Track Next / Prev | `cursorTrack.selectNext()` / `selectPrevious()` |
+| Knobs TYPE / F / Q / G | sends 1–4 on the cursor track, via `sendBank.getItemAt(n).value().inc(ticks, SEND_RESOLUTION)`. One detent = 2%. |
+| Knob press | toggles that send's `isEnabled()`. `markInterested()` on each, since `toggle()` reads current state. |
+| jog button | Tab — toggles arranger ↔ mixer via `setPanelLayout()` |
+| monitor button | Shift-Tab — into the detail editor and back to whichever layout you came from (tracked in `lastNonEditLayout`) |
 
 ### Jog Wheel
 Uses `host.createLastClickedParameter()`. The encoder sends relative CCs, so we use `param.value().inc(delta, resolution)`.
@@ -145,16 +244,36 @@ Popup notifications (`host.showPopupNotification`) remain useful as a secondary 
 
 ```
 bitwig-controller-script/
-├── CC1.control.js          # Main controller script — place in ~/Documents/Bitwig Studio/Controller Scripts/Yamaha/
-└── README.md               # This file — project context and notes
+├── CC1.control.js                        # Bitwig controller script
+├── cc-plugin/
+│   ├── install-profile.py                # writes the ControlCenter profile + prefs
+│   └── com.thomas.bitwig.ypPlugin/       # the ControlCenter plugin
+│       ├── manifest.json                 # actions the profile binds to
+│       ├── bitwig                        # the plugin itself: WebSocket in, MIDI out
+│       ├── package.json                  # @julusian/midi (prebuilt, no compiler needed)
+│       └── image/                        # action icons, borrowed from Yamaha's HUI plugin
+└── README.md
 ```
 
-The script is a single `.control.js` file. No build step needed. To install:
+Everything outside this repo is either a symlink to it or generated by `install-profile.py`, so the repo is the whole of it.
+
+**Bitwig script** — symlinked, so edits are live:
 ```bash
 mkdir -p ~/Documents/Bitwig\ Studio/Controller\ Scripts/Yamaha
-cp CC1.control.js ~/Documents/Bitwig\ Studio/Controller\ Scripts/Yamaha/
+ln -s "$PWD/CC1.control.js" ~/Documents/Bitwig\ Studio/Controller\ Scripts/Yamaha/
 ```
-Then add in Bitwig: Settings → Controllers → Add Controller → Yamaha → CC1.
+Then Settings → Controllers → Add Controller → Yamaha → CC1, and set the two MIDI inputs to `CC Virtual MIDI Driver Port1` and `CC1 Knobs`.
+
+**ControlCenter plugin and profile** — the plugin directory is symlinked too, so `npm install` and edits land straight in the repo:
+```bash
+npm install --prefix cc-plugin/com.thomas.bitwig.ypPlugin
+pkill -f '^/Applications/ControlCenter.app/Contents/MacOS/ControlCenter'
+ln -s "$PWD/cc-plugin/com.thomas.bitwig.ypPlugin" \
+  ~/Library/Application\ Support/yamaha/ControlCenter/Plugins/
+python3 cc-plugin/install-profile.py
+open -a /Applications/ControlCenter.app
+```
+Then pick **Pro Tools → Bitwig** in ControlCenter. `install-profile.py` backs the prefs up to `~/Library/Preferences/com.yamaha.ControlCenter.plist.bak` the first time it runs; restore with `defaults import com.yamaha.ControlCenter <that file>` while ControlCenter is quit.
 
 ## Next Steps
 
@@ -165,8 +284,11 @@ Then add in Bitwig: Settings → Controllers → Add Controller → Yamaha → C
 5. ~~Verify motorized fader output protocol~~ — `B0 00 MSB` + `B0 20 LSB` works.
 6. ~~Fader mode toggle (Volume / Last Clicked)~~ — wired to Automation button.
 7. ~~LED feedback~~ — works after the HUI input/output CC asymmetry was fixed.
-8. **LCD keys**: configure in ControlCenter to send F13–F24 (or other unused keys), then map those in Bitwig's keyboard shortcuts to whatever's useful.
-9. **Maybe**: long-press on Lock = `smartToggleLock` for one-press re-targeting. Skipped for now per current UX preference (toggle-only is simpler).
+8. ~~**4 multi-function knobs**~~ — reached via a custom ControlCenter plugin; driving sends 1–4, press toggles the send.
+9. ~~**jog / monitor buttons**~~ — reached the same way; Tab and Shift-Tab equivalents.
+10. **LCD keys**: currently handed to the Stream Deck app by `sdlink`, which works well. The plugin bus can take them instead (all 12 report `keyDown`/`keyUp`) — but only as unlabelled inputs, since we can't draw on them. Only worth it if you want the keys to know about Bitwig state.
+11. **Maybe**: long-press on Lock = `smartToggleLock` for one-press re-targeting. Skipped for now per current UX preference (toggle-only is simpler).
+12. **Unresolved**: plugin-bus output. `setTitle`/`setState`/`setFeedback` are accepted and ignored. Worth another look only if you want LCD key labels — the remaining lead is Yamaha's plugin binaries, which do render icons somehow.
 
 ## Reference
 

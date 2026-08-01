@@ -13,11 +13,16 @@ host.defineController(
   "0.1",
   "A86F807F-E5BA-4047-916C-391EC950D3C8",
 );
-host.defineMidiPorts(1, 1);
+// Port 2 in is "CC1 Knobs", a virtual port published by our ControlCenter plugin
+// (cc-plugin/) carrying the 4 multi-function knobs and the jog/monitor buttons — controls
+// Simple HUI does not expose at all. It only exists while ControlCenter is running; if
+// auto-discovery fails because of that, pick the ports by hand in Bitwig's controller
+// settings and it will remember them.
+host.defineMidiPorts(2, 1);
 
 if (host.platformIsMac()) {
   host.addDeviceNameBasedDiscoveryPair(
-    ["CC Virtual MIDI Driver Port1"],
+    ["CC Virtual MIDI Driver Port1", "CC1 Knobs"],
     ["CC Virtual MIDI Driver Port1"],
   );
 }
@@ -36,6 +41,26 @@ const CC_PAN_KNOB = 0x40;
 // running status, which Bitwig delivers to onMidi with status=0x20 (not 0xB0).
 const CC_FADER_MSB = 0x00;
 const CC_FADER_LSB = 0x20;
+
+// ---------------------------------------------------------------------------
+// Knob port (MIDI in 1) — our ControlCenter plugin, channel 16 so nothing can
+// collide with HUI on channel 1. Knob turns are relative: value = 64 + ticks.
+// ---------------------------------------------------------------------------
+const KNOB_CHANNEL = 0xbf;
+const CC_KNOB_TURN = 0x10; // 0x10..0x13 -> sends 1..4
+const CC_KNOB_PRESS = 0x14; // 0x14..0x17 -> toggle send enabled
+const CC_JOG_BUTTON = 0x18;
+const CC_MONITOR_BUTTON = 0x19;
+
+// Panel layouts, mirroring Bitwig's own Tab / Shift-Tab. Neither button has a lamp we can
+// drive, so both are toggles you read off the screen rather than the device.
+const PANEL_ARRANGE = "ARRANGE";
+const PANEL_MIX = "MIX";
+const PANEL_EDIT = "EDIT";
+const NUM_SENDS = 4;
+// Denominator for inc(): one detent moves a send by 1/SEND_RESOLUTION, so *lower* is a
+// bigger step. 50 = 2% per detent, tuned by hand on the hardware.
+const SEND_RESOLUTION = 50;
 
 // HUI buttons: zone selector + port selector pair. Asymmetric — input
 // (device → host, button press) uses 0x0F/0x2F; output (host → device, LED)
@@ -100,6 +125,12 @@ const RECORD_RESTART_DELAY_MS = 100;
 let transport;
 let application;
 let cursorTrack;
+let sendBank;
+
+// Active panel layout, and the last one that wasn't EDIT — so leaving the detail editor
+// returns you where you came from rather than always dumping you in the arranger.
+let panelLayout = PANEL_ARRANGE;
+let lastNonEditLayout = PANEL_ARRANGE;
 let trackVolume;
 let trackPan;
 let jogWheelParam;
@@ -176,9 +207,27 @@ function init() {
   midiIn.setMidiCallback(onMidi);
   midiIn.setSysexCallback(onSysex);
 
+  host.getMidiInPort(1).setMidiCallback(onKnobMidi);
+
   transport = host.createTransport();
   application = host.createApplication();
-  cursorTrack = host.createCursorTrack("cc1-cursor", "CC1 Cursor", 0, 0, true);
+  cursorTrack = host.createCursorTrack(
+    "cc1-cursor",
+    "CC1 Cursor",
+    NUM_SENDS,
+    0,
+    true,
+  );
+  application.panelLayout().addValueObserver(function (layout) {
+    panelLayout = layout;
+    if (layout !== PANEL_EDIT) lastNonEditLayout = layout;
+  });
+
+  sendBank = cursorTrack.sendBank();
+  // toggle() reads the current state, so the value has to be subscribed.
+  for (let i = 0; i < NUM_SENDS; i++) {
+    sendBank.getItemAt(i).isEnabled().markInterested();
+  }
 
   trackVolume = cursorTrack.volume();
   trackPan = cursorTrack.pan();
@@ -344,6 +393,36 @@ function onMidi(status, data1, data2) {
   } else if (status === CC_FADER_LSB) {
     // Running-status continuation of the fader's CC pair.
     handleFaderLSB(data1);
+  }
+}
+
+// MIDI in 1: the knob port. Everything on it is channel 16 and absolute-CC shaped.
+function onKnobMidi(status, data1, data2) {
+  if (DEBUG) printMidi(status, data1, data2);
+  if (status !== KNOB_CHANNEL) return;
+
+  if (data1 >= CC_KNOB_TURN && data1 < CC_KNOB_TURN + NUM_SENDS) {
+    const send = sendBank.getItemAt(data1 - CC_KNOB_TURN);
+    send.value().inc(data2 - 64, SEND_RESOLUTION);
+  } else if (data1 >= CC_KNOB_PRESS && data1 < CC_KNOB_PRESS + NUM_SENDS) {
+    if (data2 > 0) {
+      const send = sendBank.getItemAt(data1 - CC_KNOB_PRESS);
+      send.isEnabled().toggle();
+    }
+  } else if (data1 === CC_JOG_BUTTON) {
+    if (data2 > 0) {
+      // Tab: arranger <-> mixer.
+      application.setPanelLayout(
+        panelLayout === PANEL_ARRANGE ? PANEL_MIX : PANEL_ARRANGE,
+      );
+    }
+  } else if (data1 === CC_MONITOR_BUTTON) {
+    if (data2 > 0) {
+      // Shift-Tab: into the detail editor and back out to wherever you were.
+      application.setPanelLayout(
+        panelLayout === PANEL_EDIT ? lastNonEditLayout : PANEL_EDIT,
+      );
+    }
   }
 }
 

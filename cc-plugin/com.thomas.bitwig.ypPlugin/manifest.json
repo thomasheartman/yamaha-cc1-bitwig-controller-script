@@ -1,0 +1,47 @@
+{
+  "sdk": 2,
+  "publisher": "Thomas Heartman",
+  "name": "Bitwig probe",
+  "description": "Protocol probe: logs every ControlCenter event",
+  "icon": "image/pluginIcon",
+  "version": "0.0.1",
+  "platforms": {
+    "macos": { "main": "bitwig" },
+    "windows": { "main": "bitwig.exe" }
+  },
+  "applicationsToMonitor": {},
+  "actions": [
+    {
+      "icon": "image/TransportPlay/play",
+      "name": "Probe–Key",
+      "tooltip": "Logs key presses",
+      "states": [
+        { "image": "image/TransportPlay/play_off" },
+        { "image": "image/TransportPlay/play_on" }
+      ],
+      "autoStatesChangeDisabled": true,
+      "controls": [ "KeyPad", "LEDKeyPad" ],
+      "uuid": "com.thomas.bitwig.probekey"
+    },
+    {
+      "icon": "image/Panning/pan@40",
+      "name": "Probe–Knob",
+      "tooltip": "Logs encoder movement",
+      "states": [
+        { "image": "image/Panning/pan@144" }
+      ],
+      "controls": [ "Knob" ],
+      "uuid": "com.thomas.bitwig.probeknob"
+    },
+    {
+      "icon": "image/Fader/fader@40",
+      "name": "Probe–Fader",
+      "tooltip": "Logs fader movement",
+      "states": [
+        { "image": "image/Fader/fader@144" }
+      ],
+      "controls": [ "SmartSlider", "Slider" ],
+      "uuid": "com.thomas.bitwig.probefader"
+    }
+  ]
+}
