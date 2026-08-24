@@ -44,7 +44,7 @@ That private channel turned out to be the way in anyway — see below. The contr
 
 They connect to `ws://127.0.0.1:<port>` and send `{"event":"registerPlugin","uuid":"<pluginUUID>"}`. After that it's Stream Deck's event vocabulary verbatim. The CC1's knobs are, at the protocol level, Stream Deck + dials.
 
-**ControlCenter loads unsigned third-party plugins.** A Node script with a `#!/usr/bin/env node` shebang works; there is no code-signature check, and the plugin directory is user-writable. Yamaha's own plugins are signed, but that isn't enforced on ours.
+**ControlCenter loads unsigned third-party plugins.** There is no code-signature check and the plugin directory is user-writable, so a shell script works as the executable — Yamaha's own plugins are signed Mach-O binaries, but that isn't enforced on ours. Note it must not be a `#!/usr/bin/env node` script; see the PATH gotcha under Architecture.
 
 ### Plugin layout
 
@@ -202,6 +202,7 @@ The active ControlCenter profile is a **verbatim clone of `Pro Tools / Stream De
 
 - Our plugin only receives events **while our profile is active**. Switch the CC1 to a Cubase profile and the knobs go quiet — that is the first thing to check when they stop working.
 - The `CC1 Knobs` port only exists while ControlCenter is running, so auto-discovery can fail if Bitwig starts first. Pick the ports by hand once and Bitwig remembers.
+- **ControlCenter launches plugins with a minimal PATH** — `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin`, with no `/opt/homebrew/bin`. A `#!/usr/bin/env node` shebang therefore exits 127, and ControlCenter respawns the plugin in a tight loop forever without surfacing anything: no port, no error, no dialog. That's why `bitwig` is a `/bin/sh` launcher that locates node itself and execs `bitwig.js`. Beware that starting ControlCenter with `open -a` from a terminal *does* pass your shell's PATH, so it will appear to work when tested that way and fail when launched normally at login. `install.sh` checks for this and refuses to install.
 - `defineMidiPorts` is read when Bitwig **scans scripts at launch**. Changing the port count needs a full Bitwig restart; removing and re-adding the controller is not enough, and you'll get `Invalid MIDI port index` until you do.
 
 ### Current control bindings
@@ -250,7 +251,8 @@ bitwig-controller-script/
 │   ├── install-profile.py                # writes the ControlCenter profile + prefs
 │   └── com.thomas.bitwig.ypPlugin/       # the ControlCenter plugin
 │       ├── manifest.json                 # actions the profile binds to
-│       ├── bitwig                        # the plugin itself: WebSocket in, MIDI out
+│       ├── bitwig                        # launcher: finds node without relying on PATH
+│       ├── bitwig.js                     # the plugin itself: WebSocket in, MIDI out
 │       ├── package.json                  # @julusian/midi (prebuilt, no compiler needed)
 │       └── image/                        # action icons, borrowed from Yamaha's HUI plugin
 └── README.md

@@ -24,6 +24,18 @@ CC_APP="/Applications/ControlCenter.app"
 # lockfile is committed, so this resolves to the same version every time.
 npm ci --prefix "$REPO/cc-plugin/$PLUGIN"
 
+# The plugin runs under ControlCenter's minimal PATH, not the one in this shell. If node
+# isn't findable there it exits 127 and ControlCenter respawns it forever, silently.
+status=0
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin \
+  "$REPO/cc-plugin/$PLUGIN/bitwig" >/dev/null 2>&1 || status=$?
+if [ "$status" -eq 127 ]; then
+  echo "install.sh: the plugin cannot find node under ControlCenter's PATH." >&2
+  echo "Symlink node into /usr/local/bin, or add its path to the search list at the" >&2
+  echo "top of cc-plugin/$PLUGIN/bitwig." >&2
+  exit 1
+fi
+
 # Only ever Yamaha's ControlCenter -- never Apple's in /System/Library/CoreServices.
 pkill -f "^$CC_APP/Contents/MacOS/ControlCenter" || true
 sleep 2
