@@ -133,6 +133,9 @@ let panelLayout = PANEL_ARRANGE;
 let lastNonEditLayout = PANEL_ARRANGE;
 let trackVolume;
 let trackPan;
+let clipCursors;
+let clipStamps;
+let clipSelectionSeq = 0;
 let jogWheelParam;
 let faderParam;
 let arranger;
@@ -232,6 +235,28 @@ function init() {
   trackVolume = cursorTrack.volume();
   trackPan = cursorTrack.pan();
 
+  // Follow the clip selection (not the playhead) purely so we can ask which
+  // track owns the selected clip. 1x1 grid: we never read the notes. The
+  // generic createCursorClip() turned out to be the launcher cursor, so these
+  // two are the whole set. Each keeps its own last selection forever and
+  // neither knows about the other, so stamp them and prefer whichever moved
+  // last. exists/track-name/play-start are watched together because on their
+  // own none of them catches every selection change (same track, same start).
+  clipCursors = [
+    host.createArrangerCursorClip(1, 1),
+    host.createLauncherCursorClip(1, 1),
+  ];
+  clipStamps = [0, 0];
+  for (let i = 0; i < clipCursors.length; i++) {
+    const clip = clipCursors[i];
+    const stamp = makeClipStamper(i);
+    // addValueObserver subscribes, so these double as the markInterested that
+    // exists().get() and name().get() need.
+    clip.exists().addValueObserver(stamp);
+    clip.getTrack().name().addValueObserver(stamp);
+    clip.getPlayStart().addValueObserver(stamp);
+  }
+
   jogWheelParam = host.createLastClickedParameter("cc1-jog", "Jog Wheel");
   jogWheelParam
     .parameter()
@@ -305,7 +330,8 @@ function init() {
     0x00,
     2,
     function () {
-      cursorTrack.mute().toggle();
+      // Action, not cursorTrack.mute().toggle(): acts on every selected track.
+      application.getAction("toggle_track_mute").invoke();
     },
     null,
     "mute",
@@ -314,7 +340,8 @@ function init() {
     0x00,
     3,
     function () {
-      cursorTrack.solo().toggle();
+      // Action, not cursorTrack.solo().toggle(): acts on every selected track.
+      application.getAction("toggle_track_solo").invoke();
     },
     null,
     "solo",
@@ -323,7 +350,8 @@ function init() {
     0x00,
     7,
     function () {
-      cursorTrack.arm().toggle();
+      // Action, not cursorTrack.arm().toggle(): acts on every selected track.
+      application.getAction("toggle_track_arm").invoke();
     },
     null,
     "arm",
@@ -411,18 +439,13 @@ function onKnobMidi(status, data1, data2) {
     }
   } else if (data1 === CC_JOG_BUTTON) {
     if (data2 > 0) {
-      // Tab: arranger <-> mixer.
-      application.setPanelLayout(
-        panelLayout === PANEL_ARRANGE ? PANEL_MIX : PANEL_ARRANGE,
-      );
-    }
-  } else if (data1 === CC_MONITOR_BUTTON) {
-    if (data2 > 0) {
       // Shift-Tab: into the detail editor and back out to wherever you were.
       application.setPanelLayout(
         panelLayout === PANEL_EDIT ? lastNonEditLayout : PANEL_EDIT,
       );
     }
+  } else if (data1 === CC_MONITOR_BUTTON) {
+    if (data2 > 0) selectClipTrack();
   }
 }
 
@@ -633,6 +656,31 @@ function setJogMode(newMode) {
     lock: "Locked to " + (jogWheelParamName || "parameter"),
   };
   host.showPopupNotification("Jog Wheel: " + labels[newMode]);
+}
+
+// Bitwig's "select track on clip selection", on demand instead of as a
+// preference. cursorTrack follows the editor selection, so the fader and the
+// mute/solo/arm buttons come along.
+// Own function so each observer closes over its own index.
+function makeClipStamper(index) {
+  return function () {
+    clipStamps[index] = ++clipSelectionSeq;
+  };
+}
+
+function selectClipTrack() {
+  let best = -1;
+  for (let i = 0; i < clipCursors.length; i++) {
+    if (!clipCursors[i].exists().get()) continue;
+    if (best < 0 || clipStamps[i] > clipStamps[best]) best = i;
+  }
+  if (best < 0) return;
+
+  const track = clipCursors[best].getTrack();
+  if (DEBUG) println("Clip track -> " + track.name().get());
+  track.selectInEditor();
+  track.selectInMixer();
+  track.makeVisibleInArranger();
 }
 
 function handleFaderLSB(lsb) {
